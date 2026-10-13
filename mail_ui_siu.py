@@ -1,0 +1,221 @@
+"""HTML del mail con estética formal tipo SIU Guaraní (Bootstrap 2 de la Austral).
+
+Misma API que mail_ui (html_novedades / html_aviso). Tablas + estilos inline
+porque Gmail ignora casi todo el CSS de <style>.
+"""
+
+from datetime import datetime
+from html import escape
+
+from mail_ui import _partes
+
+LOGO = "https://siu.austral.edu.ar/portal/_comp/Austral/img/logo-transparente.png"
+
+FONDO = "#eeeeee"
+BLANCO = "#ffffff"
+GRIS_HEADER = "#f7f7f7"
+BORDE = "#dddddd"
+TEXTO = "#333333"
+TENUE = "#888888"
+AZUL = "#0088cc"        # títulos ("Historia académica")
+MARINO = "#2e2a7f"      # pestaña activa del menú / logo
+BARRA_MATERIA = "#4b7db5"  # barra de cada materia en la historia completa
+NARANJA = "#faa732"     # progress bar-warning
+FONT = "'Helvetica Neue',Helvetica,Arial,sans-serif"
+
+ETIQUETAS = {  # colores de las .label de Bootstrap 2
+    "Promocionado": "#468847",
+    "Aprobado": "#468847",
+    "Desaprobado": "#b94a48",
+    "Reprobado": "#b94a48",
+    "Ausente": "#999999",
+    "Libre": "#999999",
+}
+
+
+def _etiqueta(resultado: str) -> str:
+    if not resultado:
+        return ""
+    color = ETIQUETAS.get(resultado, "#3a87ad")
+    return (
+        f'<span style="display:inline-block;padding:2px 6px;background:{color};color:{BLANCO};'
+        f'font-family:{FONT};font-size:11px;font-weight:bold;border-radius:3px;">{escape(resultado)}</span>'
+    )
+
+
+def _titulo_seccion(texto: str) -> str:
+    # Como los h2 grises de Actuación provisoria ("Cursadas", "Exámenes").
+    return f"""
+<tr><td style="padding:18px 0 8px 0;color:#999999;font-family:{FONT};font-size:20px;font-weight:bold;">{escape(texto)}</td></tr>"""
+
+
+def _bloque_notas(titulo: str, filas: list[str]) -> str:
+    # Agrupa por materia como la Historia académica: barra azul + una línea por nota.
+    por_materia: dict[str, list[dict]] = {}
+    for fila in filas:
+        p = _partes(fila)
+        nombre = f"{p['materia']} ({p['codigo']})" if p["codigo"] else p["materia"]
+        por_materia.setdefault(nombre, []).append(p)
+    html = _titulo_seccion(titulo)
+    for materia, notas in por_materia.items():
+        lineas = ""
+        for p in notas:
+            tipo, _, desc = p["titulo"].partition(" - ")
+            desc_html = f" - {escape(desc)}" if desc else ""
+            nota = f" - <strong>{escape(p['nota'])}</strong>" if p["nota"] else ""
+            fecha = f' <span style="color:{TENUE};">{escape(p["fecha"])}</span>' if p["fecha"] else ""
+            lineas += f"""
+      <tr><td style="padding:7px 10px;border-top:1px solid #eeeeee;color:{TEXTO};font-family:{FONT};font-size:13px;line-height:1.5;">
+        <strong>{escape(tipo)}</strong>{desc_html}{nota} &nbsp;{_etiqueta(p['resultado'])}{fecha}
+      </td></tr>"""
+        html += f"""
+<tr><td style="padding:0 0 10px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDE};">
+    <tr><td bgcolor="{BARRA_MATERIA}" style="background:{BARRA_MATERIA};padding:6px 10px;color:{BLANCO};font-family:{FONT};font-size:14px;font-weight:bold;">{escape(materia)}</td></tr>{lineas}
+  </table>
+</td></tr>"""
+    return html
+
+
+def _fila_dato(clave: str, valor: str) -> str:
+    return f"""
+      <tr>
+        <td width="30%" valign="top" style="padding:5px 0;color:{TEXTO};font-family:{FONT};font-size:13px;">{escape(clave)}:</td>
+        <td valign="top" style="padding:5px 0;color:{TEXTO};font-family:{FONT};font-size:13px;">{valor}</td>
+      </tr>"""
+
+
+def _bloque_creditos(creditos: list[dict]) -> str:
+    html = _titulo_seccion("Actividades con créditos")
+    for c in creditos:
+        datos = _fila_dato("Créditos", f"<strong>{escape(c['creditos'].removesuffix('.0'))}</strong>")
+        if c.get("cuando"):
+            datos += _fila_dato("Días", escape(c["cuando"]))
+        if c.get("asistencia"):
+            datos += _fila_dato("Asistencia", f"{escape(c['asistencia'])}%")
+        if c.get("cupo") is not None:
+            ocupado = 100 if c["cupo"] == 0 else round(100 * c["inscriptos"] / c["cupo"])
+            ocupado = min(ocupado, 100)
+            libre = 100 - ocupado
+            color = "#dd514c" if c["quedan"] == 0 else NARANJA if ocupado >= 80 else "#5eb95e"
+            barra = (
+                f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:6px;border:1px solid {BORDE};">'
+                f"<tr>"
+                + (f'<td width="{ocupado}%" bgcolor="{color}" style="background:{color};padding:2px 6px;color:{TEXTO};font-family:{FONT};font-size:11px;font-weight:bold;">{ocupado}%</td>' if ocupado else "")
+                + (f'<td width="{libre}%" bgcolor="#f5f5f5" style="background:#f5f5f5;font-size:11px;">&nbsp;</td>' if libre else "")
+                + "</tr></table>"
+            )
+            quedan = "sin cupo" if c["quedan"] == 0 else f"queda{'n' if c['quedan'] != 1 else ''} {c['quedan']}"
+            datos += _fila_dato(
+                "Cupo", f"{c['cupo']} | Inscriptos: {c['inscriptos']} &nbsp;<strong>({quedan})</strong>{barra}"
+            )
+        if c.get("inscripto"):
+            datos += _fila_dato("Estado", _etiqueta("Aprobado").replace("Aprobado", "Ya estás inscripto"))
+        html += f"""
+<tr><td style="padding:0 0 12px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDE};">
+    <tr><td style="padding:10px 12px 4px 12px;color:#222222;font-family:{FONT};font-size:16px;font-weight:bold;">{escape(c['materia'])}</td></tr>
+    <tr><td style="padding:2px 12px 6px 12px;color:#222222;font-family:{FONT};font-size:13px;font-weight:bold;">&#10132; Comisión: {escape(c['comision'])}</td></tr>
+    <tr><td style="padding:0 12px 10px 12px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{datos}</table>
+    </td></tr>
+  </table>
+</td></tr>"""
+    return html
+
+
+def _boton(url: str, texto: str) -> str:
+    return f"""
+<tr><td align="right" style="padding:6px 0 4px 0;">
+  <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+    <td bgcolor="#f5f5f5" style="background:#f5f5f5;background-image:linear-gradient(#ffffff,#e6e6e6);border:1px solid #cccccc;border-bottom-color:#b3b3b3;border-radius:4px;">
+      <a href="{escape(url)}" style="display:inline-block;padding:6px 14px;color:{TEXTO};font-family:{FONT};font-size:14px;text-decoration:none;">{escape(texto)}</a>
+    </td>
+  </tr></table>
+</td></tr>"""
+
+
+def _marco(titulo: str, preheader: str, cuerpo: str, pestana: str) -> str:
+    fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+    return f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">
+<title>SIU Guaraní</title></head>
+<body style="margin:0;padding:0;background:{FONDO};" bgcolor="{FONDO}">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;">{escape(preheader)}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="{FONDO}" style="background:{FONDO};">
+<tr><td align="center" style="padding:20px 10px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="{BLANCO}" style="max-width:640px;background:{BLANCO};border:1px solid {BORDE};">
+
+    <!-- encabezado -->
+    <tr><td bgcolor="{GRIS_HEADER}" style="background:{GRIS_HEADER};padding:14px 18px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td valign="middle">
+          <img src="{LOGO}" width="190" alt="UNIVERSIDAD AUSTRAL · Módulo de Autogestión"
+               style="display:block;border:0;max-width:190px;height:auto;color:{MARINO};font-family:{FONT};font-size:16px;font-weight:bold;">
+        </td>
+        <td align="right" valign="middle" style="color:#666666;font-family:{FONT};font-size:12px;">{fecha}</td>
+      </tr></table>
+    </td></tr>
+
+    <!-- menú -->
+    <tr><td style="border-top:1px solid {BORDE};border-bottom:1px solid {BORDE};background:#f2f2f2;background-image:linear-gradient(#ffffff,#f2f2f2);" bgcolor="#f2f2f2">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+        <td bgcolor="{MARINO}" style="background:{MARINO};padding:10px 15px;color:{BLANCO};font-family:{FONT};font-size:13px;">{escape(pestana)}</td>
+        <td style="padding:10px 15px;color:#777777;font-family:{FONT};font-size:13px;border-right:1px solid #e5e5e5;">SIU Guaraní · Autogestión</td>
+      </tr></table>
+    </td></tr>
+
+    <!-- contenido -->
+    <tr><td style="padding:18px 18px 8px 18px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr><td style="padding:0 0 6px 0;border-bottom:1px solid #eeeeee;color:{AZUL};font-family:{FONT};font-size:22px;font-weight:bold;">{escape(titulo)}</td></tr>
+        <tr><td style="padding:10px 0 0 0;color:{TENUE};font-family:{FONT};font-size:13px;">{escape(preheader)}.</td></tr>
+        {cuerpo}
+      </table>
+    </td></tr>
+
+    <!-- pie -->
+    <tr><td style="padding:12px 18px;border-top:1px solid #eeeeee;color:#999999;font-family:{FONT};font-size:11px;">
+      Mensaje generado automáticamente por tu monitor de notas del SIU Guaraní. No responder.
+    </td></tr>
+  </table>
+</td></tr></table>
+</body></html>"""
+
+
+def html_novedades(
+    novedades: dict[str, list[str]],
+    titulos: dict[str, str],
+    url: str,
+    creditos: list[dict] | None = None,
+    url_cursada: str | None = None,
+) -> str:
+    creditos = creditos or []
+    total = sum(len(v) for v in novedades.values())
+    partes = []
+    if total:
+        partes.append(f"{total} nota{'s' if total != 1 else ''} nueva{'s' if total != 1 else ''}")
+    if creditos:
+        partes.append(f"{len(creditos)} actividad{'es' if len(creditos) != 1 else ''} con créditos")
+    cuerpo = "".join(_bloque_notas(titulos.get(k, k), filas) for k, filas in novedades.items())
+    if creditos:
+        cuerpo += _bloque_creditos(creditos)
+    solo_creditos = creditos and not total and url_cursada
+    cuerpo += _boton(url_cursada if solo_creditos else url, "Ir a Inscripción a materias" if solo_creditos else "Ir al SIU Guaraní")
+    titulo = "Inscripción a materias" if solo_creditos else "Novedades académicas"
+    return _marco(titulo, "Se detectaron " + " y ".join(partes), cuerpo, "Novedades")
+
+
+def html_aviso(titulo: str, mensaje: str, comando: str, url: str) -> str:
+    cuerpo = f"""
+<tr><td style="padding:14px 0 0 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#fcf8e3"
+         style="background:#fcf8e3;border:1px solid #fbeed5;border-radius:4px;">
+    <tr><td style="padding:12px 14px;color:#c09853;font-family:{FONT};font-size:13px;line-height:1.5;">
+      {escape(mensaje)}
+      <div style="margin-top:8px;padding:6px 8px;background:#f5f5f5;border:1px solid #cccccc;border-radius:3px;color:{TEXTO};font-family:Consolas,'Courier New',monospace;font-size:12px;">{escape(comando)}</div>
+    </td></tr>
+  </table>
+</td></tr>{_boton(url, "Ir al SIU Guaraní")}"""
+    return _marco(titulo, titulo, cuerpo, "Aviso")

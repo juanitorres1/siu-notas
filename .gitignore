@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+# Sesión de Microsoft y datos académicos personales
+perfil/
+estado/
+capturas/
+*.log
