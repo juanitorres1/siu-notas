@@ -15,6 +15,7 @@ el paquete `plataformas`.
   - `python siu_notas.py desprogramar` -> la elimina.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import sys
 import time
 import traceback
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
@@ -174,14 +175,17 @@ def leer_historia(page: Page) -> list[str]:
     return list(dict.fromkeys(f for f in filas if ": En curso" not in f))
 
 
-def leer_en_curso(page: Page) -> list[str]:
-    """Notas de parciales/TPs de las materias en curso. Están en el 'Detalle' de
-    cada materia, que se carga por Ajax (POST historia_academica/detalle_encurso).
+def leer_en_curso(page: Page) -> tuple[list[str], set[str]]:
+    """Notas de parciales/TPs de las materias en curso, y los códigos de esas materias.
+    Las notas están en el 'Detalle' de cada materia, que se carga por Ajax
+    (POST historia_academica/detalle_encurso).
     Una fila por evaluación: 'Materia (COD): Parcial - Primer Parcial - 9.20 (...) Aprobado 15/09/2026'."""
     page.goto(HISTORIA, wait_until="networkidle")
     page.click("a[consulta='mats_en_curso']")
     page.wait_for_selector("#listado .catedras", timeout=30_000)
     page.wait_for_load_state("networkidle")
+    titulos = page.eval_on_selector_all("#listado .catedras h3", "hs => hs.map(h => h.innerText.trim())")
+    codigos = {m.group(1) for t in titulos if (m := re.search(r"\(([^()]+)\)\s*$", t))}
     for link in page.query_selector_all("#listado .catedra_nombre a"):
         link.click()
         page.wait_for_load_state("networkidle")
@@ -199,7 +203,7 @@ def leer_en_curso(page: Page) -> list[str]:
     filas = []
     for materia, (fecha, descripcion, tipo, nota, resultado, *_) in crudas:
         filas.append(" ".join(f"{materia}: {tipo} - {descripcion} - {nota} {resultado} {fecha}".split()))
-    return list(dict.fromkeys(filas))
+    return list(dict.fromkeys(filas)), codigos
 
 
 def leer_actuacion(page: Page) -> list[str]:
@@ -299,15 +303,218 @@ def texto_credito(c: dict) -> str:
     return f"{c['materia']} — {c['comision']}: " + " | ".join(partes)
 
 
-def leer_todo(page: Page) -> tuple[dict[str, list[str]], list[dict]]:
-    """(notas por sección, comisiones con créditos)."""
+def leer_inasistencias(page: Page) -> dict[str, dict]:
+    """Reportes > Inasistencias. Devuelve {clave: falta}, clave = 'materia | fecha | tipo de clase'.
+    Si la página no carga como se espera, lanza excepción: nunca se interpreta como
+    "no tenés faltas" (eso haría avisar que se borraron todas)."""
+    page.goto(f"{SIU}/reporte_inasistencias", wait_until="networkidle")
+    page.wait_for_selector("#inasistencias", state="attached", timeout=30_000)
+    crudas = page.eval_on_selector_all(
+        "#inasistencias .actividad",
+        """bloques => bloques.flatMap(b => {
+            const materia = b.querySelector('h3')?.innerText.trim() ?? '';
+            return [...b.querySelectorAll('tr')]
+                .map(tr => [...tr.querySelectorAll('td')].map(td => td.innerText.trim()))
+                .filter(c => c.length >= 5)
+                .map(c => [materia, c]);
+        })""",
+    )
+    faltas: dict[str, dict] = {}
+    for materia, (fecha, tipo, tema, cantidad, justificada, *_) in crudas:
+        # "(GIINDTECOM) Técnicas de Comunicación - Comisión: Comunicación Efectiva Inf"
+        #   -> "Técnicas de Comunicación (GIINDTECOM) · Comunicación Efectiva Inf"
+        # La comisión importa: suele ser el nombre con el que conocés la materia.
+        m = re.match(r"\(([^)]+)\)\s*(.*?)\s*-\s*Comisi[oó]n:\s*(.*)", materia)
+        if m:
+            codigo, nombre, comision = m.groups()
+            nombre = f"{nombre} ({codigo})" + (f" · {comision}" if comision and comision != nombre else "")
+        else:
+            nombre = materia
+        try:
+            cant = float(cantidad.replace(",", "."))
+        except ValueError:
+            cant = 0.0
+        falta = {"materia": nombre, "fecha": fecha, "tipo": tipo, "tema": tema,
+                 "cantidad": cant, "justificada": justificada}
+        clave = f"{nombre} | {fecha} | {tipo}"
+        if clave in faltas:  # dos registros iguales el mismo día: se suman
+            faltas[clave]["cantidad"] += cant
+        else:
+            faltas[clave] = falta
+    return faltas
+
+
+def diff_inasistencias(previas: dict[str, dict], actuales: dict[str, dict]) -> list[dict]:
+    """Cambios por materia: [{materia, antes, ahora, cambios: [{accion, fecha, tipo, detalle}]}].
+    antes/ahora = total de inasistencias de la materia."""
+    def total(faltas: dict[str, dict], materia: str) -> float:
+        return sum(f["cantidad"] for f in faltas.values() if f["materia"] == materia)
+
+    def fmt(n: float) -> str:
+        return f"{n:g}"
+
+    cambios: dict[str, list[dict]] = {}
+    for clave in actuales.keys() | previas.keys():
+        a, p = actuales.get(clave), previas.get(clave)
+        if a and not p:
+            item = {"accion": "nueva", "detalle": f"+{fmt(a['cantidad'])} (justificada: {a['justificada']})"}
+        elif p and not a:
+            item = {"accion": "quitada", "detalle": f"-{fmt(p['cantidad'])}"}
+        elif a["cantidad"] != p["cantidad"] or a["justificada"] != p["justificada"]:
+            partes = []
+            if a["cantidad"] != p["cantidad"]:
+                partes.append(f"cantidad {fmt(p['cantidad'])} → {fmt(a['cantidad'])}")
+            if a["justificada"] != p["justificada"]:
+                partes.append(f"justificada {p['justificada']} → {a['justificada']}")
+            item = {"accion": "modificada", "detalle": ", ".join(partes)}
+        else:
+            continue
+        f = a or p
+        cambios.setdefault(f["materia"], []).append({**item, "fecha": f["fecha"], "tipo": f["tipo"]})
+
+    def orden_fecha(c: dict) -> str:
+        d = c["fecha"].split("/")
+        return "/".join(reversed(d)) if len(d) == 3 else c["fecha"]
+
+    return [
+        {"materia": materia, "antes": fmt(total(previas, materia)), "ahora": fmt(total(actuales, materia)),
+         "cambios": sorted(lista, key=orden_fecha)}
+        for materia, lista in sorted(cambios.items())
+    ]
+
+
+def texto_inasistencias(cambio: dict) -> str:
+    lineas = [f"{cambio['materia']}: {cambio['antes']} → {cambio['ahora']} inasistencias"]
+    for c in cambio["cambios"]:
+        lineas.append(f"    - {c['fecha']} ({c['tipo']}): {c['accion']}, {c['detalle']}")
+    return "\n".join(lineas)
+
+
+def leer_examenes(page: Page, codigos: set[str]) -> list[dict]:
+    """Mesas de Inscripción a exámenes de las materias en curso (por código).
+    Solo lee: entra a examen/elegir_materia/<id> (GET) y NUNCA envía el form de inscripción."""
+    page.goto(f"{SIU}/examen", wait_until="networkidle")
+    links = page.eval_on_selector_all(
+        "a[href*='/examen/elegir_materia/']", "as => as.map(a => [a.title, a.href])"
+    )
+    mesas = []
+    for titulo, href in dict(links).items():
+        m = re.search(r"\(([^()]+)\)\s*$", titulo)
+        if not m or m.group(1) not in codigos:
+            continue
+        materia = re.sub(r"\s*-\s*\(", " (", titulo)
+        page.goto(href, wait_until="networkidle")
+        crudas = page.eval_on_selector_all(
+            "#llamados_mesas li.llamado_mesa",
+            """lis => lis.map(li => ({
+                fecha: li.querySelector('p.fecha')?.innerText.trim() ?? '',
+                datos: [...li.querySelectorAll('ul li')].map(x => x.innerText.trim()),
+                inscripto: !li.classList.contains('no-inscripto'),
+            }))""",
+        )
+        for c in crudas:
+            # "Turno: FI- Mesas Especiales" -> {"turno": "FI- Mesas Especiales"}
+            datos = {}
+            for linea in c["datos"]:
+                clave, _, valor = linea.partition(":")
+                valor = " ".join(valor.split())
+                datos[normalizar(clave)] = "" if valor == "-" else valor
+            mesas.append({
+                "materia": materia,
+                "fecha": " ".join(c["fecha"].split()),
+                "turno": datos.get("turno", ""),
+                "mesa": datos.get("mesa", ""),
+                "llamado": datos.get("llamado", ""),
+                "tipo": datos.get("tipo de inscripcion", ""),
+                "ubicacion": datos.get("ubicacion", ""),
+                "lugar": datos.get("lugar", ""),
+                "docentes": datos.get("docentes", ""),
+                "inscripto": c["inscripto"],
+            })
+    return sorted(mesas, key=lambda x: _fecha_hora(x["fecha"]) or datetime.max)
+
+
+def _fecha_hora(texto: str) -> datetime | None:
+    try:
+        return datetime.strptime(texto, "%d/%m/%Y %H:%M")
+    except ValueError:
+        try:
+            return datetime.strptime(texto, "%d/%m/%Y")
+        except ValueError:
+            return None
+
+
+def clave_examen(m: dict) -> str:
+    return f"{m['materia']} | {m['fecha']} | {m['llamado'] or m['turno']}"
+
+
+def texto_examen(m: dict) -> str:
+    partes = [m["turno"], m["tipo"], " - ".join(x for x in (m["ubicacion"], m["lugar"]) if x), m["docentes"]]
+    estado = " [ya inscripto]" if m["inscripto"] else ""
+    return f"{m['fecha']} — {m['materia']}{estado}: " + " | ".join(p for p in partes if p)
+
+
+def ics_examenes(mesas: list[dict], duracion_h: int = 2) -> str:
+    """Calendario .ics con una entrada por mesa. El SIU no informa la duración:
+    se asume `duracion_h` horas. Horario de Argentina (UTC-3, sin horario de verano)."""
+    def esc(t: str) -> str:
+        return t.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+    def plegar(linea: str) -> str:  # RFC 5545: líneas de hasta 75 octetos
+        partes, actual = [], ""
+        for ch in linea:
+            if len((actual + ch).encode("utf-8")) > 75:
+                partes.append(actual)
+                actual = " " + ch
+            else:
+                actual += ch
+        return "\r\n".join(partes + [actual])
+
+    ahora = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lineas = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//siu-notas//ES", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
+    for m in mesas:
+        inicio = _fecha_hora(m["fecha"])
+        if not inicio:
+            continue
+        inicio_utc = inicio + timedelta(hours=3)
+        fin_utc = inicio_utc + timedelta(hours=duracion_h)
+        uid = hashlib.sha1(clave_examen(m).encode("utf-8")).hexdigest()
+        descripcion = "\n".join(
+            f"{k}: {v}" for k, v in (
+                ("Turno", m["turno"]), ("Llamado", m["llamado"]), ("Mesa", m["mesa"]),
+                ("Tipo de inscripción", m["tipo"]), ("Docentes", m["docentes"]),
+            ) if v
+        ) + f"\nDuración estimada ({duracion_h} h): el SIU no la informa.\n{SIU}/examen"
+        lineas += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}@siu-notas",
+            f"DTSTAMP:{ahora}",
+            f"DTSTART:{inicio_utc:%Y%m%dT%H%M%SZ}",
+            f"DTEND:{fin_utc:%Y%m%dT%H%M%SZ}",
+            f"SUMMARY:{esc('Examen: ' + m['materia'])}",
+            f"LOCATION:{esc(' - '.join(x for x in (m['ubicacion'], m['lugar']) if x))}",
+            f"DESCRIPTION:{esc(descripcion)}",
+            "END:VEVENT",
+        ]
+    lineas.append("END:VCALENDAR")
+    return "\r\n".join(plegar(l) for l in lineas) + "\r\n"
+
+
+def leer_todo(page: Page) -> dict:
+    """{'notas': {sección: [filas]}, 'creditos': [comisiones], 'inasistencias': {clave: falta},
+    'examenes': [mesas de materias en curso]}."""
     elegir_carrera(page)
-    notas = {
-        "en_curso": leer_en_curso(page),
-        "actuacion": leer_actuacion(page),
-        "historia": leer_historia(page),
+    en_curso, codigos_en_curso = leer_en_curso(page)
+    return {
+        "notas": {
+            "en_curso": en_curso,
+            "actuacion": leer_actuacion(page),
+            "historia": leer_historia(page),
+        },
+        "creditos": leer_creditos(page),
+        "inasistencias": leer_inasistencias(page),
+        "examenes": leer_examenes(page, codigos_en_curso),
     }
-    return notas, leer_creditos(page)
 
 
 # ---------- estado y mail ----------
@@ -323,7 +530,10 @@ def guardar_estado(estado: dict) -> None:
     ESTADO.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def enviar_mail(asunto: str, cuerpo: str, html: str | None = None) -> None:
+def enviar_mail(
+    asunto: str, cuerpo: str, html: str | None = None, adjuntos: list[tuple[str, str, str]] | None = None
+) -> None:
+    """adjuntos: [(nombre_archivo, contenido_texto, subtipo)] -> text/<subtipo>, ej. ('x.ics', ..., 'calendar')."""
     faltan = [k for k in ("SMTP_USER", "SMTP_PASS", "MAIL_TO") if not os.getenv(k)]
     if faltan:
         log(f"No mando mail, faltan variables en .env: {', '.join(faltan)}")
@@ -336,7 +546,9 @@ def enviar_mail(asunto: str, cuerpo: str, html: str | None = None) -> None:
     msg.set_content(cuerpo)
     if html:
         msg.add_alternative(html, subtype="html")
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    for nombre, contenido, subtipo in adjuntos or []:
+        msg.add_attachment(contenido.encode("utf-8"), maintype="text", subtype=subtipo, filename=nombre)
+    host =os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "465"))
     with smtplib.SMTP_SSL(host, port, timeout=30) as s:
         s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
@@ -369,8 +581,8 @@ def cmd_dump() -> None:
         page = ctx.new_page()
         if not ir_al_inicio(page):
             sys.exit("Sesión vencida: corré `python siu_notas.py login`.")
-        notas, creditos = leer_todo(page)
-        datos = {**notas, "creditos": creditos}
+        lectura = leer_todo(page)
+        datos = {**lectura["notas"], **{k: v for k, v in lectura.items() if k != "notas"}}
         (CAPTURAS / "filas.json").write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
         ctx.close()
     log(", ".join(f"{k}: {len(v)} filas" for k, v in datos.items()) + f" -> {CAPTURAS}")
@@ -401,15 +613,16 @@ def cmd_check() -> None:
                 log("Sesión vencida.")
                 sys.exit(2)
             estado.pop("aviso_sesion_vencida", None)
-            datos, creditos = leer_todo(page)
+            lectura = leer_todo(page)
         finally:
             ctx.close()
+    creditos = lectura["creditos"]
 
     # La foto acumula todo lo visto (no se reemplaza): si una corrida lee de menos
     # (un Detalle que no cargó, una materia que pasó de "en curso" a la historia),
     # esas filas no vuelven a avisarse como nuevas cuando reaparecen.
     novedades: dict[str, list[str]] = {}
-    for clave, filas in datos.items():
+    for clave, filas in lectura["notas"].items():
         previas = estado.get(clave)
         if previas is None:
             log(f"{clave}: primera corrida, guardo {len(filas)} filas como base.")
@@ -429,29 +642,65 @@ def cmd_check() -> None:
     log(f"creditos: {len(creditos)} comisiones con créditos, {len(nuevas_cred)} nuevas.")
     estado["creditos"] = estado.get("creditos", []) + [clave_credito(c) for c in nuevas_cred]
 
-    if novedades or nuevas_cred:
-        enviar_novedades(novedades, nuevas_cred)
+    # Inasistencias: a diferencia de las notas, pueden bajar o justificarse, así que la
+    # foto se REEMPLAZA y se compara completa (nuevas, quitadas y modificadas).
+    faltas = lectura["inasistencias"]
+    previas_faltas = estado.get("inasistencias")
+    cambios_faltas: list[dict] = []
+    if previas_faltas is None:
+        log(f"inasistencias: primera corrida, guardo {len(faltas)} como base.")
+    else:
+        cambios_faltas = diff_inasistencias(previas_faltas, faltas)
+        log(f"inasistencias: {len(faltas)} registros, {sum(len(c['cambios']) for c in cambios_faltas)} cambios.")
+    estado["inasistencias"] = faltas
+
+    # Exámenes: mesas nuevas de las materias en curso. Igual que créditos, se acumula
+    # lo visto y la primera vez se mandan todas las que haya.
+    mesas = lectura["examenes"]
+    vistas_mesas = set(estado.get("examenes", []))
+    nuevas_mesas = [m for m in mesas if clave_examen(m) not in vistas_mesas]
+    log(f"examenes: {len(mesas)} mesas de materias en curso, {len(nuevas_mesas)} nuevas.")
+    estado["examenes"] = estado.get("examenes", []) + [clave_examen(m) for m in nuevas_mesas]
+
+    if novedades or nuevas_cred or cambios_faltas or nuevas_mesas:
+        enviar_novedades(novedades, nuevas_cred, cambios_faltas, examenes=nuevas_mesas)
     estado["ultima_corrida"] = datetime.now().isoformat(timespec="seconds")
     guardar_estado(estado)
 
 
 def enviar_novedades(
-    novedades: dict[str, list[str]], creditos: list[dict] | None = None, prefijo: str = ""
+    novedades: dict[str, list[str]],
+    creditos: list[dict] | None = None,
+    faltas: list[dict] | None = None,
+    prefijo: str = "",
+    examenes: list[dict] | None = None,
 ) -> None:
-    creditos = creditos or []
+    creditos, faltas, examenes = creditos or [], faltas or [], examenes or []
     total = sum(len(v) for v in novedades.values())
     resumen = []
     if total:
         resumen.append(f"{total} nota{'s' if total != 1 else ''} nueva{'s' if total != 1 else ''}")
     if creditos:
         resumen.append(f"{len(creditos)} actividad{'es' if len(creditos) != 1 else ''} con créditos")
+    if faltas:
+        resumen.append(f"inasistencias en {len(faltas)} materia{'s' if len(faltas) != 1 else ''}")
+    if examenes:
+        resumen.append(f"{len(examenes)} mesa{'s' if len(examenes) != 1 else ''} de examen")
     bloques = [f"== {TITULOS[k]} ==\n" + "\n".join(f"• {f}" for f in filas) for k, filas in novedades.items()]
+    if examenes:
+        bloques.append(
+            "== Mesas de examen (materias en curso) ==\n" + "\n".join(f"• {texto_examen(m)}" for m in examenes)
+            + "\n\nAdjunto: examenes.ics para agregarlas a tu calendario."
+        )
     if creditos:
         bloques.append("== Actividades con créditos ==\n" + "\n".join(f"• {texto_credito(c)}" for c in creditos))
+    if faltas:
+        bloques.append("== Inasistencias ==\n" + "\n".join(f"• {texto_inasistencias(c)}" for c in faltas))
     enviar_mail(
         f"{prefijo}SIU ▸ " + " · ".join(resumen),
         "\n\n".join(bloques) + f"\n\n{INICIO}",
-        mail_ui.html_novedades(novedades, TITULOS, INICIO, creditos, f"{SIU}/cursada"),
+        mail_ui.html_novedades(novedades, TITULOS, INICIO, creditos, f"{SIU}/cursada", faltas, examenes),
+        [("examenes.ics", ics_examenes(examenes), "calendar")] if examenes else None,
     )
 
 

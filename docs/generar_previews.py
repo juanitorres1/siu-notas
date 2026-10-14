@@ -38,12 +38,38 @@ CREDITOS = [
     }
 ]
 
+FALTAS = [
+    {
+        "materia": "Sistemas Operativos (DEMO101) · Sistemas Operativos Inf",
+        "antes": "2",
+        "ahora": "3",
+        "cambios": [{"accion": "nueva", "fecha": "13/10/2026", "tipo": "Teórico-Práctica",
+                     "detalle": "+1 (justificada: No)"}],
+    },
+    {
+        "materia": "Redes (DEMO102)",
+        "antes": "1",
+        "ahora": "1",
+        "cambios": [{"accion": "modificada", "fecha": "06/10/2026", "tipo": "Práctica",
+                     "detalle": "justificada No → Si"}],
+    },
+]
+
+EXAMENES = [
+    {
+        "materia": "Sistemas Operativos (DEMO101)", "fecha": "02/12/2026 09:00", "turno": "Turno Diciembre",
+        "mesa": "Sistemas Operativos", "llamado": "Llamado 1", "tipo": "Regular", "ubicacion": "Sede Pilar",
+        "lugar": "Aula 12", "docentes": "Docente Ejemplo (Presidente)", "inscripto": False,
+    },
+]
+
 with sync_playwright() as p:
     navegador = p.chromium.launch(channel=plataforma().canal_navegador)
     for nombre, modulo in (("mail-siu", mail_ui_siu), ("mail-futurista", mail_ui)):
         html = DOCS / f"{nombre}.html"
         html.write_text(
-            modulo.html_novedades(NOTAS, TITULOS, INICIO, CREDITOS, f"{SIU}/cursada"), encoding="utf-8"
+            modulo.html_novedades(NOTAS, TITULOS, INICIO, CREDITOS, f"{SIU}/cursada", FALTAS, EXAMENES),
+            encoding="utf-8",
         )
         pagina = navegador.new_page(viewport={"width": 680, "height": 600})
         pagina.goto(html.as_uri())

@@ -124,6 +124,75 @@ def _bloque_creditos(creditos: list[dict]) -> str:
     return html
 
 
+ACCIONES = {  # etiqueta y color por tipo de cambio en inasistencias
+    "nueva": ("Nueva", "#b94a48"),
+    "quitada": ("Quitada", "#468847"),
+    "modificada": ("Modificada", "#3a87ad"),
+}
+
+
+def _bloque_faltas(faltas: list[dict]) -> str:
+    html = _titulo_seccion("Inasistencias")
+    for m in faltas:
+        subio = float(m["ahora"]) > float(m["antes"])
+        bajo = float(m["ahora"]) < float(m["antes"])
+        flecha = "&#9650;" if subio else "&#9660;" if bajo else "="
+        color_total = "#f2dede" if subio else "#dff0d8" if bajo else "#d9edf7"
+        lineas = ""
+        for c in m["cambios"]:
+            texto, color = ACCIONES.get(c["accion"], (c["accion"].title(), "#999999"))
+            etiqueta = (
+                f'<span style="display:inline-block;padding:2px 6px;background:{color};color:{BLANCO};'
+                f'font-family:{FONT};font-size:11px;font-weight:bold;border-radius:3px;">{escape(texto)}</span>'
+            )
+            lineas += f"""
+      <tr>
+        <td width="22%" style="padding:7px 10px;border-top:1px solid #eeeeee;color:{TEXTO};font-family:{FONT};font-size:13px;">{escape(c['fecha'])}</td>
+        <td style="padding:7px 10px;border-top:1px solid #eeeeee;color:{TEXTO};font-family:{FONT};font-size:13px;">
+          {etiqueta} &nbsp;{escape(c['tipo'])} <span style="color:{TENUE};">· {escape(c['detalle'])}</span>
+        </td>
+      </tr>"""
+        html += f"""
+<tr><td style="padding:0 0 10px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDE};">
+    <tr><td colspan="2" bgcolor="{BARRA_MATERIA}" style="background:{BARRA_MATERIA};padding:6px 10px;color:{BLANCO};font-family:{FONT};font-size:14px;font-weight:bold;">{escape(m['materia'])}</td></tr>
+    <tr><td colspan="2" bgcolor="{color_total}" style="background:{color_total};padding:7px 10px;color:{TEXTO};font-family:{FONT};font-size:13px;">
+      Total de inasistencias: <strong>{escape(m['antes'])} {flecha} {escape(m['ahora'])}</strong>
+    </td></tr>{lineas}
+  </table>
+</td></tr>"""
+    return html
+
+
+def _bloque_examenes(mesas: list[dict]) -> str:
+    html = _titulo_seccion("Mesas de examen")
+    html += f"""
+<tr><td style="padding:0 0 10px 0;color:{TENUE};font-family:{FONT};font-size:12px;">
+  De tus materias en curso. Adjunto va <strong>examenes.ics</strong>: abrilo para agregarlas a tu calendario.
+</td></tr>"""
+    for m in mesas:
+        datos = ""
+        for clave, valor in (
+            ("Turno", m.get("turno")), ("Llamado", m.get("llamado")), ("Tipo de inscripción", m.get("tipo")),
+            ("Ubicación", " - ".join(x for x in (m.get("ubicacion"), m.get("lugar")) if x)), ("Docentes", m.get("docentes")),
+        ):
+            if valor:
+                datos += _fila_dato(clave, escape(valor))
+        if m.get("inscripto"):
+            datos += _fila_dato("Estado", _etiqueta("Aprobado").replace("Aprobado", "Ya estás inscripto"))
+        html += f"""
+<tr><td style="padding:0 0 12px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDE};">
+    <tr><td bgcolor="{BARRA_MATERIA}" style="background:{BARRA_MATERIA};padding:6px 10px;color:{BLANCO};font-family:{FONT};font-size:14px;font-weight:bold;">{escape(m['materia'])}</td></tr>
+    <tr><td style="padding:10px 12px 2px 12px;color:#222222;font-family:{FONT};font-size:15px;font-weight:bold;">&#128197; {escape(m['fecha'])}</td></tr>
+    <tr><td style="padding:0 12px 10px 12px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{datos}</table>
+    </td></tr>
+  </table>
+</td></tr>"""
+    return html
+
+
 def _boton(url: str, texto: str) -> str:
     return f"""
 <tr><td align="right" style="padding:6px 0 4px 0;">
@@ -190,21 +259,32 @@ def html_novedades(
     url: str,
     creditos: list[dict] | None = None,
     url_cursada: str | None = None,
+    faltas: list[dict] | None = None,
+    examenes: list[dict] | None = None,
 ) -> str:
-    creditos = creditos or []
+    creditos, faltas, examenes = creditos or [], faltas or [], examenes or []
     total = sum(len(v) for v in novedades.values())
     partes = []
     if total:
         partes.append(f"{total} nota{'s' if total != 1 else ''} nueva{'s' if total != 1 else ''}")
+    if examenes:
+        partes.append(f"{len(examenes)} mesa{'s' if len(examenes) != 1 else ''} de examen")
     if creditos:
         partes.append(f"{len(creditos)} actividad{'es' if len(creditos) != 1 else ''} con créditos")
+    if faltas:
+        partes.append(f"cambios de inasistencias en {len(faltas)} materia{'s' if len(faltas) != 1 else ''}")
     cuerpo = "".join(_bloque_notas(titulos.get(k, k), filas) for k, filas in novedades.items())
+    if examenes:
+        cuerpo += _bloque_examenes(examenes)
+    if faltas:
+        cuerpo += _bloque_faltas(faltas)
     if creditos:
         cuerpo += _bloque_creditos(creditos)
-    solo_creditos = creditos and not total and url_cursada
+    solo_creditos = creditos and not total and not faltas and not examenes and url_cursada
     cuerpo += _boton(url_cursada if solo_creditos else url, "Ir a Inscripción a materias" if solo_creditos else "Ir al SIU Guaraní")
     titulo = "Inscripción a materias" if solo_creditos else "Novedades académicas"
-    return _marco(titulo, "Se detectaron " + " y ".join(partes), cuerpo, "Novedades")
+    verbo = "Se detectó" if len(partes) == 1 and partes[0].startswith("1 ") else "Se detectaron"
+    return _marco(titulo, f"{verbo} " + " y ".join(partes), cuerpo, "Novedades")
 
 
 def html_aviso(titulo: str, mensaje: str, comando: str, url: str) -> str:

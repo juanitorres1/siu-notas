@@ -5,6 +5,8 @@ Revisa tu SIU Guaraní cada hora (salvo de noche) y te manda un **mail solo cuan
 - 📝 **Notas de parciales y TPs** de las materias en curso
 - 📄 **Actuación provisoria** (finales recién cargados)
 - 🎓 **Historia académica** (nota definitiva)
+- 📅 **Mesas de examen** de las materias que estás cursando, con un `.ics` adjunto para agregarlas al calendario
+- 🗓️ **Inasistencias**: si suben, bajan o te las justifican (con el total por materia antes → después)
 - ⭐ **Actividades que dan créditos** en Inscripción a materias, con días, % de asistencia y cupo restante
 
 Corre en tu propia PC con Windows, usa tu sesión de la Austral y no guarda tu contraseña de la facultad.
@@ -105,6 +107,8 @@ Programador de tareas (cada 60 min)
           • Actuación provisoria (Cursadas / Promociones / Exámenes)
           • Historia académica → Historia completa
           • Inscripción a materias → cada actividad → comisiones con "N créditos" en Observaciones
+          • Reportes → Inasistencias
+          • Inscripción a exámenes → solo las materias en curso (por código) → mesas
        5. Compara contra todo lo ya visto (estado/snapshot.json)
        6. Si hay algo nuevo → mail. Si no → nada.
 ```
@@ -115,6 +119,8 @@ Programador de tareas (cada 60 min)
 |---|---|
 | Nota nueva (parcial/TP, actuación provisoria o definitiva) | ✅ una vez |
 | Nota corregida (ej. 6 → 7) | ✅ (es una línea nueva) |
+| Aparece una mesa de examen de una materia en curso | ✅ con fecha, turno, sede, docentes y `examenes.ics` adjunto (duración estimada en 2 h: el SIU no la informa) |
+| Inasistencia nueva, quitada o modificada (cantidad o justificación) | ✅ con el total de la materia antes → después |
 | Aparece una comisión nueva que da créditos | ✅ con días, asistencia y cupo de ese momento |
 | Cambia el cupo de una actividad ya avisada | ❌ |
 | Revisión sin cambios | ❌ |
@@ -122,7 +128,7 @@ Programador de tareas (cada 60 min)
 | Error pasajero (sin red al despertar la notebook, SIU lento) | ❌ reintenta al minuto; si sigue, lo intenta en la próxima revisión |
 | El script falla **3 revisiones seguidas** (cambió la página, sin red hace horas, etc.) | ⚠️ **un** aviso, hasta que vuelva a andar |
 
-La foto en `estado/snapshot.json` **acumula** todo lo visto: si una corrida lee de menos (un detalle que no cargó, una materia que pasó de "en curso" a la historia), esas notas no se vuelven a avisar cuando reaparecen.
+La foto en `estado/snapshot.json` **acumula** todo lo visto: si una corrida lee de menos (un detalle que no cargó, una materia que pasó de "en curso" a la historia), esas notas no se vuelven a avisar cuando reaparecen. Las **inasistencias** son la excepción: como pueden bajar o justificarse, se guarda la foto completa de cada corrida y se compara entera (nuevas, quitadas y modificadas). Si el reporte no carga bien, la corrida cuenta como error en vez de interpretarse como "se borraron tus faltas".
 
 ### Cómo entra al SIU
 
@@ -133,7 +139,7 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 
 ### Seguridad y privacidad
 
-- **Solo lee.** En Inscripción a materias abre cada actividad para mirarla y **nunca** envía el formulario de "Inscribirse" ni "Dar de baja".
+- **Solo lee.** En Inscripción a materias y a exámenes abre cada actividad para mirarla y **nunca** envía el formulario de "Inscribirse" ni "Dar de baja".
 - `.env` (Gmail), `perfil/` (sesión de Microsoft), `estado/` (tus notas) y `capturas/` están en `.gitignore`. **No los subas nunca.**
 - Los mails salen de tu Gmail a vos. Ningún servicio externo ve tus notas.
 - Frecuencia razonable (cada hora, nada de noche) para no cargar el servidor de la facultad.

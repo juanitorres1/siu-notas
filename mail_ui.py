@@ -212,26 +212,120 @@ def _encabezado_seccion(icono: str, titulo: str, n: int) -> str:
 </td></tr>"""
 
 
+COLOR_ACCION = {"nueva": ROJO, "quitada": VERDE, "modificada": CIAN}
+
+
+def _tarjeta_faltas(m: dict) -> str:
+    antes, ahora = float(m["antes"]), float(m["ahora"])
+    color = ROJO if ahora > antes else VERDE if ahora < antes else CIAN
+    flecha = "▲" if ahora > antes else "▼" if ahora < antes else "="
+    lineas = "".join(
+        f'<div style="color:{TENUE};font-family:{SANS};font-size:13px;line-height:1.45;margin-top:4px;">'
+        f'<span style="color:{COLOR_ACCION.get(c["accion"], TENUE)};font-family:{MONO};font-size:11px;letter-spacing:1px;text-transform:uppercase;">{escape(c["accion"])}</span>'
+        f' &nbsp;{escape(c["fecha"])} · {escape(c["tipo"])} · {escape(c["detalle"])}</div>'
+        for c in m["cambios"]
+    )
+    return f"""
+<tr><td style="padding:0 0 12px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="{PANEL}"
+         style="background:{PANEL};border:1px solid {BORDE};border-left:3px solid {color};border-radius:10px;">
+    <tr>
+      <td style="padding:16px 18px;vertical-align:top;">
+        <div style="color:{TEXTO};font-family:{SANS};font-size:16px;font-weight:600;line-height:1.3;">{escape(m["materia"])}</div>
+        <div style="color:{color};font-family:{MONO};font-size:11px;letter-spacing:1.5px;margin-top:6px;">▸ INASISTENCIAS {escape(m["antes"])} {flecha} {escape(m["ahora"])}</div>
+        {lineas}
+      </td>
+      <td width="84" align="center" style="padding:16px 16px 12px 0;vertical-align:top;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border:2px solid {color};border-radius:12px;">
+          <tr><td align="center" style="padding:10px 12px 4px 12px;min-width:44px;color:{color};font-family:{MONO};font-size:26px;font-weight:700;line-height:1;text-shadow:0 0 12px {color};">{escape(m["ahora"])}</td></tr>
+          <tr><td align="center" style="padding:0 8px 8px 8px;color:{color};font-family:{MONO};font-size:9px;letter-spacing:2px;">FALTAS</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td></tr>"""
+
+
+MESES = ["ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"]
+
+
+def _tarjeta_examen(m: dict) -> str:
+    fecha = re.match(r"(\d{2})/(\d{2})/(\d{4})(?:\s+(\d{1,2}:\d{2}))?", m["fecha"])
+    if fecha:
+        dia, mes, hora = fecha.group(1), MESES[int(fecha.group(2)) - 1], fecha.group(4) or ""
+    else:
+        dia, mes, hora = "?", "", m["fecha"]
+    detalles = []
+    for icono, valor in (("◷", m.get("turno")), ("◈", m.get("tipo")),
+                         ("⌖", " - ".join(x for x in (m.get("ubicacion"), m.get("lugar")) if x)),
+                         ("◉", m.get("docentes"))):
+        if valor:
+            detalles.append(f"{icono} {escape(valor)}")
+    if m.get("inscripto"):
+        detalles.append(f'<span style="color:{VERDE};">✓ Ya estás inscripto</span>')
+    lineas = "".join(
+        f'<div style="color:{TENUE};font-family:{SANS};font-size:13px;line-height:1.45;margin-top:4px;">{d}</div>'
+        for d in detalles
+    )
+    return f"""
+<tr><td style="padding:0 0 12px 0;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="{PANEL}"
+         style="background:{PANEL};border:1px solid {BORDE};border-left:3px solid {AMBAR};border-radius:10px;">
+    <tr>
+      <td style="padding:16px 18px;vertical-align:top;">
+        <div style="color:{TEXTO};font-family:{SANS};font-size:16px;font-weight:600;line-height:1.3;">{escape(m["materia"])}</div>
+        <div style="color:{AMBAR};font-family:{MONO};font-size:11px;letter-spacing:1.5px;margin-top:6px;">▸ {escape(m["fecha"])}</div>
+        {lineas}
+      </td>
+      <td width="84" align="center" style="padding:16px 16px 12px 0;vertical-align:top;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="border:2px solid {AMBAR};border-radius:12px;">
+          <tr><td align="center" style="padding:8px 12px 0 12px;color:{AMBAR};font-family:{MONO};font-size:10px;letter-spacing:2px;">{mes}</td></tr>
+          <tr><td align="center" style="padding:2px 12px;min-width:44px;color:{AMBAR};font-family:{MONO};font-size:26px;font-weight:700;line-height:1;text-shadow:0 0 12px {AMBAR};">{dia}</td></tr>
+          <tr><td align="center" style="padding:0 8px 8px 8px;color:{AMBAR};font-family:{MONO};font-size:10px;letter-spacing:1px;">{escape(hora)}</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td></tr>"""
+
+
 def html_novedades(
     novedades: dict[str, list[str]],
     titulos: dict[str, str],
     url: str,
     creditos: list[dict] | None = None,
     url_cursada: str | None = None,
+    faltas: list[dict] | None = None,
+    examenes: list[dict] | None = None,
 ) -> str:
-    creditos = creditos or []
+    creditos, faltas, examenes = creditos or [], faltas or [], examenes or []
     total = sum(len(v) for v in novedades.values())
     partes = []
     if total:
         partes.append(f"{total} nota{'s' if total != 1 else ''} nueva{'s' if total != 1 else ''}")
+    if examenes:
+        partes.append(f"{len(examenes)} mesa{'s' if len(examenes) != 1 else ''} de examen")
     if creditos:
         partes.append(f"{len(creditos)} actividad{'es' if len(creditos) != 1 else ''} con créditos")
+    if faltas:
+        partes.append(f"inasistencias en {len(faltas)} materia{'s' if len(faltas) != 1 else ''}")
     cuerpo = "".join(_seccion(k, titulos.get(k, k), filas) for k, filas in novedades.items())
+    if examenes:
+        cuerpo += _encabezado_seccion("▣", "Mesas de examen", len(examenes))
+        cuerpo += (
+            f'<tr><td style="padding:0 0 12px 0;color:{TENUE};font-family:{SANS};font-size:12px;">'
+            "De tus materias en curso · adjunto <span style=\"color:" + AMBAR + ";\">examenes.ics</span> para tu calendario</td></tr>"
+        )
+        cuerpo += "".join(_tarjeta_examen(m) for m in examenes)
+    if faltas:
+        cuerpo += _encabezado_seccion("◎", "Inasistencias", len(faltas))
+        cuerpo += "".join(_tarjeta_faltas(m) for m in faltas)
     if creditos:
         cuerpo += _encabezado_seccion("✦", "Actividades con créditos", len(creditos))
         cuerpo += "".join(_tarjeta_credito(c) for c in creditos)
     # Si solo hay créditos, el botón lleva directo a Inscripción a materias.
-    destino, boton = (url_cursada, "IR A INSCRIPCIÓN") if creditos and not total and url_cursada else (url, "ABRIR SIU")
+    solo_creditos = creditos and not total and not faltas and not examenes and url_cursada
+    destino, boton = (url_cursada, "IR A INSCRIPCIÓN") if solo_creditos else (url, "ABRIR SIU")
     return _marco(" · ".join(partes) or "sin novedades", cuerpo, destino, boton)
 
 
