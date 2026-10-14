@@ -256,7 +256,7 @@ def _tarjeta_examen(m: dict) -> str:
     else:
         dia, mes, hora = "?", "", m["fecha"]
     detalles = []
-    for icono, valor in (("◷", m.get("turno")), ("◈", m.get("tipo")),
+    for icono, valor in (("◆", m.get("motivo")), ("◷", m.get("turno")), ("◈", m.get("tipo")),
                          ("⌖", " - ".join(x for x in (m.get("ubicacion"), m.get("lugar")) if x)),
                          ("◉", m.get("docentes"))):
         if valor:
@@ -314,7 +314,7 @@ def html_novedades(
         cuerpo += _encabezado_seccion("▣", "Mesas de examen", len(examenes))
         cuerpo += (
             f'<tr><td style="padding:0 0 12px 0;color:{TENUE};font-family:{SANS};font-size:12px;">'
-            "De tus materias en curso · adjunto <span style=\"color:" + AMBAR + ";\">examenes.ics</span> para tu calendario</td></tr>"
+            "De tus materias en curso y finales pendientes · adjunto <span style=\"color:" + AMBAR + ";\">examenes.ics</span> para tu calendario</td></tr>"
         )
         cuerpo += "".join(_tarjeta_examen(m) for m in examenes)
     if faltas:

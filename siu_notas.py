@@ -159,22 +159,45 @@ def elegir_carrera(page: Page) -> None:
     raise RuntimeError(f"No encontré la carrera '{CARRERA}' en el selector de propuestas.")
 
 
-def leer_historia(page: Page) -> list[str]:
-    """Una fila por nota: 'Materia (COD): Examen - 7.00 (Siete) Aprobado 18/07/2024'."""
+def leer_historia(page: Page) -> tuple[list[str], dict[str, dict]]:
+    """Notas de la historia completa y finales pendientes.
+    - filas: una por nota, 'Materia (COD): Examen - 7.00 (Siete) Aprobado 18/07/2024'.
+    - pendientes: {código: {materia, vencimiento}} de materias con la regularidad aprobada
+      y sin examen aprobado, promoción ni equivalencia (= falta rendir el final)."""
     page.goto(HISTORIA, wait_until="networkidle")
     page.click("a[consulta='todo']")
     page.wait_for_selector("#listado .catedras", timeout=30_000)
     page.wait_for_load_state("networkidle")
-    crudas = page.eval_on_selector_all(
+    bloques = page.eval_on_selector_all(
         "#listado .catedras",
-        """bloques => bloques.flatMap(b => {
-            const materia = b.querySelector('h3')?.innerText.trim() ?? '';
-            return [...b.querySelectorAll('.catedra_nombre')].map(n => [materia, n.innerText]);
-        })""",
+        r"""bloques => bloques.map(b => ({
+            materia: b.querySelector('h3')?.innerText.trim() ?? '',
+            // Cada .catedra trae su estado como atributo: examen="Aprobado", regularidad="Aprobado",
+            // promocion="Promocionado", equivalencia="Aprobado", encurso=..., examen="Reprobado".
+            catedras: [...b.querySelectorAll('.catedra')].map(c => ({
+                texto: c.querySelector('.catedra_nombre')?.innerText ?? '',
+                estados: [...c.attributes].filter(a => a.name !== 'class').map(a => [a.name, a.value]),
+                vencimiento: (c.querySelector('.toggle_info_catedra')?.textContent.match(/Vencimiento:\s*(\d{2}\/\d{2}\/\d{4})/) || [])[1] ?? '',
+            })),
+        }))""",
     )
-    filas = [f"{materia}: {limpiar(texto)}" for materia, texto in crudas]
-    # "En curso - Inicio de dictado ..." no es una nota.
-    return list(dict.fromkeys(f for f in filas if ": En curso" not in f))
+    filas, pendientes = [], {}
+    for b in bloques:
+        # "En curso - Inicio de dictado ..." no es una nota.
+        filas += [f"{b['materia']}: {limpiar(c['texto'])}" for c in b["catedras"] if c["texto"]
+                  and not limpiar(c["texto"]).startswith("En curso")]
+        estados = [(n, v) for c in b["catedras"] for n, v in c["estados"]]
+        regular = any(n == "regularidad" and v == "Aprobado" for n, v in estados)
+        aprobada = any(n not in ("regularidad", "encurso") and v in ("Aprobado", "Promocionado") for n, v in estados)
+        en_curso = any(n == "encurso" for n, _ in estados)
+        m = re.search(r"\(([^()]+)\)\s*$", b["materia"])
+        if regular and not aprobada and not en_curso and m:
+            vencimientos = [c["vencimiento"] for c in b["catedras"]
+                            if ("regularidad", "Aprobado") in [tuple(e) for e in c["estados"]] and c["vencimiento"]]
+            # La regularidad más reciente es la que vale.
+            vencimiento = max(vencimientos, key=lambda d: _fecha_hora(d) or datetime.min, default="")
+            pendientes[m.group(1)] = {"materia": b["materia"], "vencimiento": vencimiento}
+    return list(dict.fromkeys(filas)), pendientes
 
 
 def leer_en_curso(page: Page) -> tuple[list[str], set[str]]:
@@ -392,8 +415,9 @@ def texto_inasistencias(cambio: dict) -> str:
     return "\n".join(lineas)
 
 
-def leer_examenes(page: Page, codigos: set[str]) -> list[dict]:
-    """Mesas de Inscripción a exámenes de las materias en curso (por código).
+def leer_examenes(page: Page, motivos: dict[str, str]) -> list[dict]:
+    """Mesas de Inscripción a exámenes de las materias que te interesan, cruzadas por código.
+    `motivos` = {código: por qué se vigila} (ej. "Cursando", "Final pendiente · regular hasta ...").
     Solo lee: entra a examen/elegir_materia/<id> (GET) y NUNCA envía el form de inscripción."""
     page.goto(f"{SIU}/examen", wait_until="networkidle")
     links = page.eval_on_selector_all(
@@ -402,8 +426,9 @@ def leer_examenes(page: Page, codigos: set[str]) -> list[dict]:
     mesas = []
     for titulo, href in dict(links).items():
         m = re.search(r"\(([^()]+)\)\s*$", titulo)
-        if not m or m.group(1) not in codigos:
+        if not m or m.group(1) not in motivos:
             continue
+        motivo = motivos[m.group(1)]
         materia = re.sub(r"\s*-\s*\(", " (", titulo)
         page.goto(href, wait_until="networkidle")
         crudas = page.eval_on_selector_all(
@@ -432,6 +457,7 @@ def leer_examenes(page: Page, codigos: set[str]) -> list[dict]:
                 "lugar": datos.get("lugar", ""),
                 "docentes": datos.get("docentes", ""),
                 "inscripto": c["inscripto"],
+                "motivo": motivo,
             })
     return sorted(mesas, key=lambda x: _fecha_hora(x["fecha"]) or datetime.max)
 
@@ -453,7 +479,8 @@ def clave_examen(m: dict) -> str:
 def texto_examen(m: dict) -> str:
     partes = [m["turno"], m["tipo"], " - ".join(x for x in (m["ubicacion"], m["lugar"]) if x), m["docentes"]]
     estado = " [ya inscripto]" if m["inscripto"] else ""
-    return f"{m['fecha']} — {m['materia']}{estado}: " + " | ".join(p for p in partes if p)
+    motivo = f" ({m['motivo']})" if m.get("motivo") else ""
+    return f"{m['fecha']} — {m['materia']}{motivo}{estado}: " + " | ".join(p for p in partes if p)
 
 
 def ics_examenes(mesas: list[dict], duracion_h: int = 2) -> str:
@@ -483,7 +510,7 @@ def ics_examenes(mesas: list[dict], duracion_h: int = 2) -> str:
         uid = hashlib.sha1(clave_examen(m).encode("utf-8")).hexdigest()
         descripcion = "\n".join(
             f"{k}: {v}" for k, v in (
-                ("Turno", m["turno"]), ("Llamado", m["llamado"]), ("Mesa", m["mesa"]),
+                ("Motivo", m.get("motivo", "")), ("Turno", m["turno"]), ("Llamado", m["llamado"]), ("Mesa", m["mesa"]),
                 ("Tipo de inscripción", m["tipo"]), ("Docentes", m["docentes"]),
             ) if v
         ) + f"\nDuración estimada ({duracion_h} h): el SIU no la informa.\n{SIU}/examen"
@@ -502,20 +529,38 @@ def ics_examenes(mesas: list[dict], duracion_h: int = 2) -> str:
     return "\r\n".join(plegar(l) for l in lineas) + "\r\n"
 
 
+def motivos_examen(en_curso: set[str], pendientes: dict[str, dict], hoy: datetime | None = None) -> dict[str, str]:
+    """{código: motivo} de las materias cuyas mesas interesan: las que cursás y los finales pendientes."""
+    hoy = hoy or datetime.now()
+    motivos = {}
+    for codigo, p in pendientes.items():
+        venc = _fecha_hora(p["vencimiento"]) if p["vencimiento"] else None
+        if not venc:
+            motivos[codigo] = "Final pendiente"
+        elif venc.date() >= hoy.date():
+            motivos[codigo] = f"Final pendiente · regular hasta {p['vencimiento']}"
+        else:
+            motivos[codigo] = f"Final pendiente · regularidad vencida el {p['vencimiento']} (¿libre?)"
+    motivos.update({c: "Cursando" for c in en_curso})  # si está en curso, ese es el motivo
+    return motivos
+
+
 def leer_todo(page: Page) -> dict:
     """{'notas': {sección: [filas]}, 'creditos': [comisiones], 'inasistencias': {clave: falta},
-    'examenes': [mesas de materias en curso]}."""
+    'examenes': [mesas de materias en curso y finales pendientes], 'pendientes': {código: ...}}."""
     elegir_carrera(page)
     en_curso, codigos_en_curso = leer_en_curso(page)
+    historia, pendientes = leer_historia(page)
     return {
         "notas": {
             "en_curso": en_curso,
             "actuacion": leer_actuacion(page),
-            "historia": leer_historia(page),
+            "historia": historia,
         },
         "creditos": leer_creditos(page),
         "inasistencias": leer_inasistencias(page),
-        "examenes": leer_examenes(page, codigos_en_curso),
+        "examenes": leer_examenes(page, motivos_examen(codigos_en_curso, pendientes)),
+        "pendientes": pendientes,
     }
 
 
@@ -663,7 +708,9 @@ def cmd_check() -> None:
     mesas = lectura["examenes"]
     vistas_mesas = set(estado.get("examenes", []))
     nuevas_mesas = [m for m in mesas if clave_examen(m) not in vistas_mesas]
-    log(f"examenes: {len(mesas)} mesas de materias en curso, {len(nuevas_mesas)} nuevas.")
+    pendientes = lectura["pendientes"]
+    log(f"examenes: {len(mesas)} mesas (materias en curso + {len(pendientes)} finales pendientes), "
+        f"{len(nuevas_mesas)} nuevas.")
     estado["examenes"] = estado.get("examenes", []) + [clave_examen(m) for m in nuevas_mesas]
 
     if novedades or nuevas_cred or cambios_faltas or nuevas_mesas:
@@ -693,7 +740,7 @@ def enviar_novedades(
     bloques = [f"== {TITULOS[k]} ==\n" + "\n".join(f"• {f}" for f in filas) for k, filas in novedades.items()]
     if examenes:
         bloques.append(
-            "== Mesas de examen (materias en curso) ==\n" + "\n".join(f"• {texto_examen(m)}" for m in examenes)
+            "== Mesas de examen (materias en curso y finales pendientes) ==\n" + "\n".join(f"• {texto_examen(m)}" for m in examenes)
             + "\n\nAdjunto: examenes.ics para agregarlas a tu calendario."
         )
     if creditos:

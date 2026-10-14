@@ -171,11 +171,12 @@ def _bloque_examenes(mesas: list[dict]) -> str:
     html = _titulo_seccion("Mesas de examen")
     html += f"""
 <tr><td style="padding:0 0 10px 0;color:{TENUE};font-family:{FONT};font-size:12px;">
-  De tus materias en curso. Adjunto va <strong>examenes.ics</strong>: abrilo para agregarlas a tu calendario.
+  De tus materias en curso y finales pendientes. Adjunto va <strong>examenes.ics</strong>: abrilo para agregarlas a tu calendario.
 </td></tr>"""
     for m in mesas:
         datos = ""
         for clave, valor in (
+            ("Motivo", m.get("motivo")),
             ("Turno", m.get("turno")), ("Llamado", m.get("llamado")), ("Tipo de inscripción", m.get("tipo")),
             ("Ubicación", " - ".join(x for x in (m.get("ubicacion"), m.get("lugar")) if x)), ("Docentes", m.get("docentes")),
         ):

@@ -5,7 +5,7 @@ Revisa tu SIU Guaraní cada hora (salvo de noche) y te manda un **mail solo cuan
 - 📝 **Notas de parciales y TPs** de las materias en curso
 - 📄 **Actuación provisoria** (finales recién cargados)
 - 🎓 **Historia académica** (nota definitiva)
-- 📅 **Mesas de examen** de las materias que estás cursando, con un `.ics` adjunto para agregarlas al calendario
+- 📅 **Mesas de examen** de las materias que estás cursando **y de las que regularizaste pero te falta el final**, con un `.ics` adjunto para agregarlas al calendario
 - 🗓️ **Inasistencias**: si suben, bajan o te las justifican (con el total por materia antes → después)
 - ⭐ **Actividades que dan créditos** en Inscripción a materias, con días, % de asistencia y cupo restante
 
@@ -128,7 +128,7 @@ Programador de tareas (cada 60 min)
           • Historia académica → Historia completa
           • Inscripción a materias → cada actividad → comisiones con "N créditos" en Observaciones
           • Reportes → Inasistencias
-          • Inscripción a exámenes → solo las materias en curso (por código) → mesas
+          • Inscripción a exámenes → materias en curso + finales pendientes (regularizada sin aprobar), por código → mesas
        5. Compara contra todo lo ya visto (estado/snapshot.json)
        6. Si hay algo nuevo → mail. Si no → nada.
 ```
@@ -139,7 +139,7 @@ Programador de tareas (cada 60 min)
 |---|---|
 | Nota nueva (parcial/TP, actuación provisoria o definitiva) | ✅ una vez |
 | Nota corregida (ej. 6 → 7) | ✅ (es una línea nueva) |
-| Aparece una mesa de examen de una materia en curso | ✅ con fecha, turno, sede, docentes y `examenes.ics` adjunto (duración estimada en 2 h: el SIU no la informa) |
+| Aparece una mesa de examen de una materia en curso o con final pendiente | ✅ con el motivo (cursando / regular hasta tal fecha / regularidad vencida), fecha, turno, sede, docentes y `examenes.ics` adjunto (duración estimada en 2 h: el SIU no la informa) |
 | Inasistencia nueva, quitada o modificada (cantidad o justificación) | ✅ con el total de la materia antes → después |
 | Aparece una comisión nueva que da créditos | ✅ con días, asistencia y cupo de ese momento |
 | Cambia el cupo de una actividad ya avisada | ❌ |
