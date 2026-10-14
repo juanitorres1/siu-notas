@@ -9,7 +9,10 @@ from html import escape
 
 from mail_ui import _partes
 
-LOGO = "https://siu.austral.edu.ar/portal/_comp/Austral/img/logo-transparente.png"
+# Sin logo ni marca de la universidad: el Reglamento General de Estudiantes de la Austral
+# (Otras conductas, inc. t) pide usar su nombre, símbolos y logos solo con permiso.
+# El encabezado es texto propio ("SIU Notas").
+
 
 FONDO = "#eeeeee"
 BLANCO = "#ffffff"
@@ -18,7 +21,7 @@ BORDE = "#dddddd"
 TEXTO = "#333333"
 TENUE = "#888888"
 AZUL = "#0088cc"        # títulos ("Historia académica")
-MARINO = "#2e2a7f"      # pestaña activa del menú / logo
+MARINO = "#2e2a7f"      # pestaña activa del menú / título
 BARRA_MATERIA = "#4b7db5"  # barra de cada materia en la historia completa
 NARANJA = "#faa732"     # progress bar-warning
 FONT = "'Helvetica Neue',Helvetica,Arial,sans-serif"
@@ -220,8 +223,8 @@ def _marco(titulo: str, preheader: str, cuerpo: str, pestana: str) -> str:
     <tr><td bgcolor="{GRIS_HEADER}" style="background:{GRIS_HEADER};padding:14px 18px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
         <td valign="middle">
-          <img src="{LOGO}" width="190" alt="UNIVERSIDAD AUSTRAL · Módulo de Autogestión"
-               style="display:block;border:0;max-width:190px;height:auto;color:{MARINO};font-family:{FONT};font-size:16px;font-weight:bold;">
+          <div style="color:{MARINO};font-family:{FONT};font-size:22px;font-weight:bold;letter-spacing:.5px;">SIU Notas</div>
+          <div style="color:#777777;font-family:{FONT};font-size:11px;letter-spacing:1px;text-transform:uppercase;margin-top:2px;">Monitor personal del SIU Guaraní · no oficial</div>
         </td>
         <td align="right" valign="middle" style="color:#666666;font-family:{FONT};font-size:12px;">{fecha}</td>
       </tr></table>
@@ -284,7 +287,8 @@ def html_novedades(
     cuerpo += _boton(url_cursada if solo_creditos else url, "Ir a Inscripción a materias" if solo_creditos else "Ir al SIU Guaraní")
     titulo = "Inscripción a materias" if solo_creditos else "Novedades académicas"
     verbo = "Se detectó" if len(partes) == 1 and partes[0].startswith("1 ") else "Se detectaron"
-    return _marco(titulo, f"{verbo} " + " y ".join(partes), cuerpo, "Novedades")
+    lista = partes[0] if len(partes) == 1 else ", ".join(partes[:-1]) + " y " + partes[-1]
+    return _marco(titulo, f"{verbo} {lista}", cuerpo, "Novedades")
 
 
 def html_aviso(titulo: str, mensaje: str, comando: str, url: str) -> str:
