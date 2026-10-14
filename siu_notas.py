@@ -10,6 +10,7 @@ el paquete `plataformas`.
   - `python siu_notas.py login`        -> abre el navegador para loguearte a mano (MFA).
   - `python siu_notas.py dump`         -> guarda lo leído en ./capturas/filas.json.
   - `python siu_notas.py test-mail`    -> prueba la config SMTP.
+  - `python siu_notas.py test-whatsapp` -> prueba el aviso por WhatsApp (CallMeBot).
   - `python siu_notas.py verificar`    -> chequea los requisitos del sistema.
   - `python siu_notas.py programar`    -> crea la ejecución periódica (SIU_INTERVALO_MIN).
   - `python siu_notas.py desprogramar` -> la elimina.
@@ -35,6 +36,7 @@ from playwright.sync_api import BrowserContext, Page, sync_playwright
 import mail_ui as mail_ui_futurista
 import mail_ui_siu
 import plataformas
+import whatsapp
 
 BASE = Path(__file__).parent
 PERFIL = BASE / "perfil"
@@ -608,6 +610,8 @@ def cmd_check() -> None:
                             INICIO,
                         ),
                     )
+                    avisar_whatsapp("*SIU ▸ sesión caída*\nNo pude entrar al SIU: hay que volver a loguearse. "
+                                    "Los pasos están en tu mail.")
                     estado["aviso_sesion_vencida"] = True
                     guardar_estado(estado)
                 log("Sesión vencida.")
@@ -703,6 +707,28 @@ def enviar_novedades(
         [("examenes.ics", ics_examenes(examenes), "calendar")] if examenes else None,
     )
 
+    # WhatsApp: por defecto solo el resumen (sin notas ni materias, porque pasa por CallMeBot).
+    texto = f"*{prefijo}SIU ▸ novedades*\n" + "\n".join(f"• {r}" for r in resumen)
+    if whatsapp.detalle_completo():
+        detalle = [f for filas in novedades.values() for f in filas]
+        detalle += [texto_examen(m) for m in examenes]
+        detalle += [texto_inasistencias(c).splitlines()[0] for c in faltas]
+        detalle += [texto_credito(c) for c in creditos]
+        texto += "\n\n" + "\n".join(f"- {d}" for d in detalle)
+    avisar_whatsapp(texto + "\n\nEl detalle está en tu mail.")
+
+
+def avisar_whatsapp(texto: str) -> None:
+    """Aviso complementario: si WhatsApp no está configurado no hace nada, y si falla
+    solo queda en el log (el mail ya salió)."""
+    if not whatsapp.configurado():
+        return
+    try:
+        whatsapp.enviar(texto)
+        log("WhatsApp enviado.")
+    except Exception as e:
+        log(f"No pude mandar el WhatsApp: {e}")
+
 
 def cmd_test_mail() -> None:
     """Manda un mail de muestra con algunas notas reales ya vistas (o una de ejemplo)."""
@@ -711,6 +737,12 @@ def cmd_test_mail() -> None:
     if not muestra:
         muestra = {"en_curso": ["Materia de prueba (TEST): Parcial - Primer Parcial - 9.20 (Nueve con 20/100) Aprobado 15/09/2026"]}
     enviar_novedades(muestra, prefijo="[PRUEBA] ")  # sin créditos: requieren scrapear cursada
+
+
+def cmd_test_whatsapp() -> None:
+    if not whatsapp.configurado():
+        sys.exit("Falta WHATSAPP_TELEFONO o WHATSAPP_APIKEY en .env (ver README -> Aviso por WhatsApp).")
+    log(f"CallMeBot: {whatsapp.enviar('*SIU Notas* ✅ Prueba de WhatsApp: si te llegó esto, está todo bien.')}")
 
 
 def en_silencio(ahora: datetime | None = None) -> bool:
@@ -773,7 +805,11 @@ def check_con_aviso_de_error() -> None:
                 )
             except Exception:
                 log("Tampoco pude mandar el mail de error:\n" + traceback.format_exc())
+                avisar_whatsapp(f"*SIU ▸ el monitor está fallando*\n{FALLOS_PARA_AVISAR} revisiones seguidas con error "
+                                "y tampoco pude mandar el mail. Mirá estado/siu.log.")
                 sys.exit(1)
+            avisar_whatsapp(f"*SIU ▸ el monitor está fallando*\n{FALLOS_PARA_AVISAR} revisiones seguidas con error. "
+                            "Más info en tu mail.")
             estado["aviso_error"] = True
             guardar_estado(estado)
         sys.exit(1)
@@ -813,6 +849,7 @@ if __name__ == "__main__":
         "check": check_con_aviso_de_error,
         "dump": cmd_dump,
         "test-mail": cmd_test_mail,
+        "test-whatsapp": cmd_test_whatsapp,
         "verificar": cmd_verificar,
         "programar": cmd_programar,
         "desprogramar": cmd_desprogramar,

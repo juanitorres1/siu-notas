@@ -91,6 +91,26 @@ Esto crea la tarea **"SIU notas"** en el Programador de tareas de Windows, confi
 
 Para usar otro intervalo: `SIU_INTERVALO_MIN=30 ./setup.sh programar`. Para borrarla: `./setup.sh desprogramar`.
 
+### 5. (Opcional) Aviso por WhatsApp
+
+Además del mail, te puede llegar un WhatsApp corto cada vez que hay novedades, usando [CallMeBot](https://www.callmebot.com/blog/free-api-whatsapp-messages/) (gratis, solo uso personal).
+
+1. Agendá el número del bot de CallMeBot. Está en [su página](https://www.callmebot.com/blog/free-api-whatsapp-messages/); fijate ahí porque puede cambiar.
+2. Mandale por WhatsApp, desde **tu** número: `I allow callmebot to send me messages`
+3. Te responde con tu **apikey**. Si no llega en 2 minutos, probá de nuevo en 24 h.
+4. Completá en `.env`: `WHATSAPP_TELEFONO` (Argentina: `+549` + área + número, sin el 15) y `WHATSAPP_APIKEY`.
+5. Probá:
+   ```bash
+   .venv/Scripts/python siu_notas.py test-whatsapp
+   ```
+
+Cómo funciona y qué tener en cuenta:
+- Los mensajes salen **del número de CallMeBot hacia el tuyo**. Tu cuenta de WhatsApp no se automatiza, así que tu número no corre riesgo.
+- Por defecto (`WHATSAPP_DETALLE=resumen`) solo dice **cuántas** novedades hay ("1 nota nueva · inasistencias en 1 materia") y te manda al mail. Las notas y materias **no** pasan por CallMeBot. Con `WHATSAPP_DETALLE=completo` se incluye el detalle.
+- También avisa "sesión caída" y "el monitor está fallando".
+- Es complementario: si CallMeBot falla o deja de existir, queda en el log y el mail llega igual.
+- Cada persona activa **su propio** número y su propia apikey. No compartas la tuya.
+
 ---
 
 ## Cómo funciona
@@ -152,6 +172,7 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 |---|---|
 | `.venv/Scripts/python siu_notas.py check` | Una revisión completa (lo que corre la tarea) |
 | `.venv/Scripts/python siu_notas.py test-mail` | Manda un mail de muestra con notas ya vistas |
+| `.venv/Scripts/python siu_notas.py test-whatsapp` | Manda un WhatsApp de prueba (si está configurado) |
 | `.venv/Scripts/python siu_notas.py login` | Abre Edge para loguearte a mano |
 | `.venv/Scripts/python siu_notas.py dump` | Guarda lo que lee en `capturas/filas.json` (para depurar) |
 | `.venv/Scripts/python siu_notas.py verificar` | Chequea los requisitos del sistema (navegador, venv) |
@@ -190,6 +211,7 @@ plataformas/
   windows.py            # Edge + Programador de tareas (PowerShell)
 mail_ui_siu.py          # diseño del mail formal tipo SIU
 mail_ui.py              # diseño del mail futurista
+whatsapp.py             # aviso opcional por WhatsApp (CallMeBot)
 setup.sh                # instalación (bash, multiplataforma) y atajos para programar
 .env.example            # plantilla de configuración
 docs/                   # imágenes del README (datos ficticios) y su generador
