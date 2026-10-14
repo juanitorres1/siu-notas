@@ -20,6 +20,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 import traceback
 import unicodedata
 from datetime import datetime
@@ -127,7 +128,9 @@ def ir_al_inicio(page: Page) -> bool:
     page.goto(INICIO, wait_until="networkidle")
     if esta_logueado(page):
         return True
-    page.goto(f"{SIU}/acceso?auth=saml", wait_until="networkidle")
+    # El login de Microsoft casi nunca llega a "networkidle" (telemetría, polling):
+    # alcanza con que cargue el DOM; lo que importa es si vuelve solo al SIU.
+    page.goto(f"{SIU}/acceso?auth=saml", wait_until="domcontentloaded")
     try:
         page.wait_for_url(en_siu, timeout=30_000)
         page.wait_for_load_state("networkidle")
@@ -475,20 +478,37 @@ def en_silencio(ahora: datetime | None = None) -> bool:
     return desde <= hora < hasta if desde <= hasta else hora >= desde or hora < hasta
 
 
+REINTENTO_SEG = 60       # espera antes del segundo intento dentro de la misma corrida
+FALLOS_PARA_AVISAR = 3   # corridas seguidas con error antes de mandar el mail
+
+
 def check_con_aviso_de_error() -> None:
-    """`check` para la tarea programada: si falla algo inesperado (cambió la página
-    del SIU, no hay red, etc.) avisa por mail UNA vez y no de nuevo hasta que vuelva
-    a andar. Las corridas sin cambios no mandan nada."""
+    """`check` para la tarea programada. Los errores pasajeros (sin red al despertar
+    la notebook, el SIU lento) no avisan: reintenta una vez dentro de la corrida y
+    solo manda mail si fallan FALLOS_PARA_AVISAR corridas seguidas. Ese mail sale
+    UNA vez hasta que vuelva a andar. Las corridas sin cambios no mandan nada."""
     if en_silencio():
         log(f"Horario de silencio (SIU_SILENCIO={os.getenv('SIU_SILENCIO')}), no reviso.")
         return
     try:
-        cmd_check()
+        try:
+            cmd_check()
+        except SystemExit:
+            raise
+        except Exception as e:
+            log(f"Falló el check ({type(e).__name__}: {str(e).splitlines()[0]}); reintento en {REINTENTO_SEG} s.")
+            time.sleep(REINTENTO_SEG)
+            cmd_check()
     except SystemExit:
         raise
     except Exception:
         log("Error en check:\n" + traceback.format_exc())
         estado = cargar_estado()
+        estado["fallos_seguidos"] = estado.get("fallos_seguidos", 0) + 1
+        guardar_estado(estado)
+        if estado["fallos_seguidos"] < FALLOS_PARA_AVISAR:
+            log(f"Fallo {estado['fallos_seguidos']}/{FALLOS_PARA_AVISAR} seguido; todavía no aviso.")
+            sys.exit(1)
         if not estado.get("aviso_error"):
             try:
                 enviar_mail(
@@ -496,7 +516,8 @@ def check_con_aviso_de_error() -> None:
                     f"Revisá el log en {LOG}\n\n{traceback.format_exc()}",
                     mail_ui.html_aviso(
                         "Monitor con errores",
-                        "La revisión del SIU está fallando. Mirá el log o corré el check a mano para ver el error:",
+                        f"Las últimas {FALLOS_PARA_AVISAR} revisiones del SIU fallaron. "
+                        "Mirá el log o corré el check a mano para ver el error:",
                         plataforma().comando("check"),
                         INICIO,
                     ),
@@ -509,7 +530,9 @@ def check_con_aviso_de_error() -> None:
         sys.exit(1)
     else:
         estado = cargar_estado()
-        if estado.pop("aviso_error", None):
+        avisado = estado.pop("aviso_error", None)
+        fallos = estado.pop("fallos_seguidos", None)
+        if avisado or fallos:
             guardar_estado(estado)
             log("Volvió a funcionar.")
 

@@ -119,7 +119,8 @@ Programador de tareas (cada 60 min)
 | Cambia el cupo de una actividad ya avisada | ❌ |
 | Revisión sin cambios | ❌ |
 | No puede entrar al SIU | ⚠️ **un** aviso, hasta que se arregle |
-| El script falla (cambió la página, sin red, etc.) | ⚠️ **un** aviso, hasta que vuelva a andar |
+| Error pasajero (sin red al despertar la notebook, SIU lento) | ❌ reintenta al minuto; si sigue, lo intenta en la próxima revisión |
+| El script falla **3 revisiones seguidas** (cambió la página, sin red hace horas, etc.) | ⚠️ **un** aviso, hasta que vuelva a andar |
 
 La foto en `estado/snapshot.json` **acumula** todo lo visto: si una corrida lee de menos (un detalle que no cargó, una materia que pasó de "en curso" a la historia), esas notas no se vuelven a avisar cuando reaparecen.
 
