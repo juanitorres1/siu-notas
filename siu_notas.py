@@ -28,6 +28,7 @@ import json
 import os
 import random
 import re
+import signal
 import smtplib
 import subprocess
 import sys
@@ -89,6 +90,7 @@ TITULOS = {
 }
 
 NOMBRE_TAREA = "SIU notas"
+NOMBRE_TAREA_INSCRIPCION = "SIU inscripcion"  # arranque automático de `inscribir` al iniciar sesión
 
 LOG = RAIZ / "estado" / "siu.log"
 LOG_MAX = 1_000_000  # bytes; al pasarlo se queda con la segunda mitad
@@ -214,6 +216,10 @@ def sembrar_cookies(ctx: BrowserContext) -> bool:
     global _cookies_sembradas
     cookies = [] if _cookies_sembradas else leer_cookies_env(ENV_USUARIO)
     _cookies_sembradas = True
+    # Solo las que el perfil no tiene: las suyas pueden ser más frescas (Microsoft las va renovando) y las del
+    # .env son de la última exportación. La cookie de sesión del SIU no se persiste al cerrar Chromium: esa sí falta.
+    tiene = {(c["name"], c["domain"], c["path"]) for c in ctx.cookies()}
+    cookies = [c for c in cookies if (c.get("name"), c.get("domain"), c.get("path")) not in tiene]
     if not cookies:
         return False
     try:
@@ -973,12 +979,70 @@ def cmd_dump() -> None:
     log(", ".join(f"{k}: {len(v)} filas" for k, v in datos.items()) + f" -> {CAPTURAS}")
 
 
-def inscripcion_en_curso() -> bool:
-    """¿Hay un `inscribir` vivo? (el lock se toca en cada vuelta; uno viejo es de un proceso muerto)."""
+def _pid_vivo(pid: int) -> bool:
+    if sys.platform == "win32":  # os.kill(pid, 0) en Windows NO es un chequeo: manda Ctrl+C
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        proceso = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not proceso:
+            return False
+        try:
+            codigo = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(proceso, ctypes.byref(codigo))) and codigo.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(proceso)
     try:
-        return time.time() - LOCK_INSCRIPCION.stat().st_mtime < LOCK_VIVO_SEG
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def lock_vivo(lock: Path) -> bool:
+    """¿Ese lock es de un `inscribir` vivo? Se toca en cada vuelta Y guarda el PID: tras un apagado brusco el
+    lock puede ser reciente pero de un proceso que ya no existe (si no, el arranque automático lo respetaría)."""
+    try:
+        if time.time() - lock.stat().st_mtime >= LOCK_VIVO_SEG:
+            return False
+        return _pid_vivo(int(lock.read_text().strip()))
     except FileNotFoundError:
         return False
+    except ValueError:  # lock sin PID (formato viejo): vale solo la fecha
+        return True
+
+
+def inscripcion_en_curso() -> bool:
+    """¿Hay un `inscribir` vivo de este usuario? (comparte perfil con `check`)"""
+    return lock_vivo(LOCK_INSCRIPCION)
+
+
+# "Ya cumplida": si el pedido (alias + profesor) ya terminó con éxito, no vuelve a vigilar. Sin esto, el arranque
+# automático seguiría buscando en cada encendido y, vía --profesor, podría anotarte en OTRA materia del mismo docente.
+CUMPLIDAS = RAIZ / "estado" / "inscripciones.json"
+
+
+def clave_pedido(aliases: list[str], profesor: str) -> str:
+    base = "|".join(sorted(compacto(a) for a in aliases)) + "||" + normalizar(profesor)
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+
+
+def pedido_cumplido(clave: str) -> dict | None:
+    try:
+        return json.loads(CUMPLIDAS.read_text(encoding="utf-8")).get(clave)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def marcar_cumplido(clave: str, materia: str) -> None:
+    try:
+        datos = json.loads(CUMPLIDAS.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        datos = {}
+    datos[clave] = {"materia": materia, "fecha": datetime.now().isoformat(timespec="seconds")}
+    CUMPLIDAS.parent.mkdir(parents=True, exist_ok=True)
+    CUMPLIDAS.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class SesionCaida(RuntimeError):
@@ -1064,12 +1128,16 @@ def inscribir_varios(args: argparse.Namespace) -> None:
     base_cmd = [sys.executable, str(Path(__file__).resolve())]
     log(f"Lanzo la inscripción de {len(usuarios)} usuarios en paralelo: {', '.join(usuarios)}. Ctrl+C corta a todos.")
     hijos = []
+    # Sin consola (arranque automático con pythonw) los hijos no tienen dónde escribir: sin esto, una tubería sin
+    # lector se llena y los traba. Su salida igual queda en usuarios/<u>/estado/siu.log.
+    salida = {} if sys.stdout else dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for u in usuarios:
         # "--" antes de los alias: uno que empiece con "-" no se confunde con una opción.
         cmd = [*base_cmd, "--usuario", u, "inscribir", "--intervalo", args.intervalo]
         cmd += ["--profesor", args.profesor] if args.profesor else []
         cmd += ["--simular"] if args.simular else []
-        hijos.append((u, subprocess.Popen([*cmd, "--", *args.aliases])))
+        cmd += ["--repetir"] if args.repetir else []
+        hijos.append((u, subprocess.Popen([*cmd, "--", *args.aliases], **salida)))
     codigos: dict[str, int] = {}
     try:
         for u, proceso in hijos:
@@ -1088,9 +1156,9 @@ def inscribir_varios(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def cmd_inscribir(argv: list[str]) -> None:
+def parser_inscribir(prog: str = "siu_notas.py inscribir") -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="siu_notas.py inscribir",
+        prog=prog,
         description="Espera (polling) a que la materia aparezca en Inscripción a materias con cupo y se anota "
                     "en la primera comisión disponible. Es lo único de este proyecto que escribe en el SIU.")
     ap.add_argument("aliases", nargs="+", help="nombres posibles de la MISMA materia (nombre, variantes, typos o código)")
@@ -1098,21 +1166,38 @@ def cmd_inscribir(argv: list[str]) -> None:
     ap.add_argument("--simular", action="store_true", help="busca y dice qué haría, sin inscribirse")
     ap.add_argument("--intervalo", default="5-10", help="segundos entre consultas, 'min-max' al azar (por defecto 5-10)")
     ap.add_argument("--usuarios", default="", help="varios usuarios a la vez, ej. juani,mateo, o 'todos' (los de `usuarios`)")
-    args = ap.parse_args(argv)
+    ap.add_argument("--repetir", action="store_true", help="vuelve a intentar aunque este pedido ya haya sido cumplido")
+    return ap
+
+
+def leer_intervalo(ap: argparse.ArgumentParser, texto: str) -> tuple[float, float]:
     try:
-        extremos = [float(x) for x in args.intervalo.split("-")]
+        extremos = [float(x) for x in texto.split("-")]
         minimo, maximo = extremos[0], extremos[-1]
         if len(extremos) > 2 or not 2 <= minimo <= maximo:
             raise ValueError
     except ValueError:
         ap.error("--intervalo tiene que ser 'min-max' en segundos, con min >= 2 (ej. 5-10)")
+    return minimo, maximo
+
+
+def cmd_inscribir(argv: list[str]) -> None:
+    ap = parser_inscribir()
+    args = ap.parse_args(argv)
+    minimo, maximo = leer_intervalo(ap, args.intervalo)
     if args.usuarios:
         return inscribir_varios(args)
+    clave = clave_pedido(args.aliases, args.profesor)
+    cumplido = None if (args.simular or args.repetir) else pedido_cumplido(clave)
+    if cumplido:
+        log(f"Este pedido ya está cumplido ({cumplido['materia']}, {cumplido['fecha']}): no vuelvo a vigilar. "
+            f"Para repetirlo: --repetir (o borrá {CUMPLIDAS.relative_to(BASE).as_posix()}).")
+        return
     if inscripcion_en_curso():
         sys.exit("Ya hay un `inscribir` corriendo (estado/inscribiendo.lock). Cortalo antes de lanzar otro.")
 
     LOCK_INSCRIPCION.parent.mkdir(parents=True, exist_ok=True)
-    LOCK_INSCRIPCION.touch()
+    LOCK_INSCRIPCION.write_text(str(os.getpid()))  # el PID permite distinguir un proceso vivo de un lock viejo
     log(f"Inscripción automática{' (SIMULACIÓN)' if args.simular else ''}: alias={args.aliases}"
         + (f", profesor='{args.profesor}'" if args.profesor else "") + f", cada {minimo:g}-{maximo:g} s. Ctrl+C para cortar.")
     cache: dict = {}
@@ -1140,6 +1225,8 @@ def cmd_inscribir(argv: list[str]) -> None:
                             elegida = elegir_comision(comisiones)
                             if ya:
                                 log(f"Ya estás inscripto en {materia}, comisión '{ya['comision']}'. No hago nada.")
+                                if not args.simular:
+                                    marcar_cumplido(clave, materia)
                                 return
                             if not comisiones:
                                 motivo = f"{materia} existe pero todavía no tiene comisiones"
@@ -1158,6 +1245,7 @@ def cmd_inscribir(argv: list[str]) -> None:
                                 ok, mensaje = inscribir_en_comision(page, titulo, href, elegida)
                                 if ok:
                                     log(f"Inscripto en {materia}, comisión '{elegida['comision']}'. SIU: {mensaje or '-'}")
+                                    marcar_cumplido(clave, materia)
                                     avisar_inscripcion("Inscripto ✅", f"Te anoté en {materia}.",
                                                        f"Comisión {elegida['comision']}")
                                     return
@@ -1468,11 +1556,89 @@ def cmd_desprogramar() -> None:
     log(f"Tarea '{NOMBRE_TAREA}' eliminada.")
 
 
+def _ultima_linea(archivo: Path) -> str:
+    try:
+        lineas = [l for l in archivo.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
+        return lineas[-1][:110] if lineas else "-"
+    except FileNotFoundError:
+        return "-"
+
+
+def cmd_autoinicio(argv: list[str]) -> None:
+    """`autoinicio ALIAS...`: crea una tarea que lanza `inscribir` solo al iniciar sesión en la PC."""
+    if USUARIO:
+        sys.exit("autoinicio se usa sin --usuario: la tarea lanza a los usuarios con --usuarios.")
+    ap = parser_inscribir("siu_notas.py autoinicio")
+    args = ap.parse_args(argv)
+    leer_intervalo(ap, args.intervalo)
+    if args.simular:
+        ap.error("--simular no tiene sentido en el arranque automático (es para probar a mano).")
+    if args.usuarios.strip().lower() != "todos":
+        nombres = [u.strip() for u in args.usuarios.split(",") if u.strip()]
+        faltan = [u for u in nombres if not NOMBRE_USUARIO.fullmatch(u) or not tiene_sesion(u)]
+        if faltan:
+            sys.exit("Sin sesión (o nombre inválido): " + ", ".join(faltan) + ". Agregalos con `agregar-usuario NOMBRE`.")
+    cmd_verificar()
+    pedido = ["inscribir", "--intervalo", args.intervalo]
+    pedido += ["--profesor", args.profesor] if args.profesor else []
+    pedido += ["--usuarios", args.usuarios] if args.usuarios else []
+    pedido += ["--", *args.aliases]
+    log(plataforma().programar_al_iniciar(NOMBRE_TAREA_INSCRIPCION, pedido))
+    log(f"Va a arrancar solo, 30 s después de iniciar sesión en Windows. Ahora mismo: `{comando_cli('autoinicio-iniciar')}`. "
+        f"Ver: `{comando_cli('autoinicio-estado')}`. Quitar: `{comando_cli('autoinicio-quitar')}`.")
+    if args.usuarios.strip().lower() == "todos":
+        log("Con --usuarios todos, los usuarios que agregues después entran solos en el próximo arranque.")
+
+
+def cmd_autoinicio_iniciar() -> None:
+    if plataforma().estado_tarea(NOMBRE_TAREA_INSCRIPCION) == "no existe":
+        sys.exit(f"No hay arranque automático. Creálo con `{comando_cli('autoinicio', 'ALIAS...', '--usuarios', 'todos')}`.")
+    plataforma().iniciar_tarea(NOMBRE_TAREA_INSCRIPCION)
+    log(f"Tarea '{NOMBRE_TAREA_INSCRIPCION}' iniciada. Ver: `{comando_cli('autoinicio-estado')}`.")
+
+
+def cmd_autoinicio_estado() -> None:
+    estado = plataforma().estado_tarea(NOMBRE_TAREA_INSCRIPCION)
+    print(f"Tarea '{NOMBRE_TAREA_INSCRIPCION}': {estado}")
+    if estado == "no existe":
+        print(f"Creála con: {comando_cli('autoinicio', 'ALIAS...', '--usuarios', 'todos')}")
+        return
+    raices = [("(principal)", BASE)] + [(u, BASE / "usuarios" / u) for u in usuarios_existentes()]
+    for nombre, raiz in raices:
+        vivo = lock_vivo(raiz / "estado" / "inscribiendo.lock")
+        if nombre == "(principal)" and not vivo:
+            continue
+        print(f"  {nombre:<12}{'vigilando' if vivo else 'parado':<11}{_ultima_linea(raiz / 'estado' / 'siu.log')}")
+
+
+def cmd_autoinicio_quitar() -> None:
+    """Quita el arranque automático y corta lo que esté vigilando (no depende de que el Programador mate a los hijos)."""
+    existe = plataforma().estado_tarea(NOMBRE_TAREA_INSCRIPCION) != "no existe"
+    if existe:
+        plataforma().detener_tarea(NOMBRE_TAREA_INSCRIPCION)
+        plataforma().desprogramar(NOMBRE_TAREA_INSCRIPCION)
+    cortados = []
+    for nombre, raiz in [("(principal)", BASE)] + [(u, BASE / "usuarios" / u) for u in usuarios_existentes()]:
+        lock = raiz / "estado" / "inscribiendo.lock"
+        if lock_vivo(lock):
+            try:
+                os.kill(int(lock.read_text().strip()), signal.SIGTERM)  # en Windows termina el proceso
+                cortados.append(nombre)
+            except (ValueError, OSError):
+                pass
+            lock.unlink(missing_ok=True)
+    log(("Arranque automático eliminado. " if existe else "No había arranque automático. ")
+        + (f"Corté la vigilancia de: {', '.join(cortados)}." if cortados else "No había nada vigilando."))
+
+
 if __name__ == "__main__":
     comandos = {
         "login": cmd_login,
         "cookies": cmd_cookies,
         "usuarios": cmd_usuarios,
+        "autoinicio-iniciar": cmd_autoinicio_iniciar,
+        "autoinicio-estado": cmd_autoinicio_estado,
+        "autoinicio-quitar": cmd_autoinicio_quitar,
         "check": check_con_aviso_de_error,
         "dump": cmd_dump,
         "test-mail": cmd_test_mail,
@@ -1481,11 +1647,10 @@ if __name__ == "__main__":
         "programar": cmd_programar,
         "desprogramar": cmd_desprogramar,
     }
-    if len(sys.argv) >= 2 and sys.argv[1] == "inscribir":
-        cmd_inscribir(sys.argv[2:])
-    elif len(sys.argv) >= 2 and sys.argv[1] == "agregar-usuario":
-        cmd_agregar_usuario(sys.argv[2:])
+    con_argumentos = {"inscribir": cmd_inscribir, "agregar-usuario": cmd_agregar_usuario, "autoinicio": cmd_autoinicio}
+    if len(sys.argv) >= 2 and sys.argv[1] in con_argumentos:
+        con_argumentos[sys.argv[1]](sys.argv[2:])
     elif len(sys.argv) != 2 or sys.argv[1] not in comandos:
-        sys.exit(f"Uso: python siu_notas.py [{'|'.join([*comandos, 'inscribir', 'agregar-usuario'])}]")
+        sys.exit(f"Uso: python siu_notas.py [{'|'.join([*comandos, *con_argumentos])}]")
     else:
         comandos[sys.argv[1]]()

@@ -192,7 +192,7 @@ Para materias donde el cupo vuela: `inscribir` consulta **Inscripción a materia
 Queda corriendo en la terminal hasta lograrlo o hasta que lo cortes con Ctrl+C.
 
 ```bash
-.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" "hackathon ai" "hackathon ia" --profesor "martin salaberri"
+.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" "hackathon ai" "hackathon ia" "GIINFHACKAI" --profesor "martin salaberri"
 ```
 
 - **Alias**: son nombres posibles de **la misma materia**. Matchean sin importar mayúsculas, tildes,
@@ -205,7 +205,13 @@ Queda corriendo en la terminal hasta lograrlo o hasta que lo cortes con Ctrl+C.
   todavía no estás anotado, esa también es candidata; usalo cuando no haya otra materia suya a la vista.
 - **`--simular`**: hace todo menos inscribirse. Dice qué comisión elegiría y si encontró el botón, y guarda la
   página en `capturas/`. **Probalo primero con una materia que ya esté abierta.**
-- **`--intervalo 5-10`**: segundos entre consultas (mínimo 2).
+- **`--intervalo 5-10`** (por defecto): pausa al azar de 5 a 10 s **entre** consultas (mínimo 2). Cada consulta tarda
+  ~1 s (medido), así que cada usuario consulta el SIU cada ~6–11 s (promedio ~8 s, unas 7 por minuto). Con
+  `--profesor`, además relee las materias abiertas cada 10 min (~1 s por materia). No respeta `SIU_SILENCIO`: corre
+  las 24 h mientras la PC esté prendida.
+- **Ya cumplido:** al anotarse (o si ya estabas anotado), el pedido queda registrado en
+  `estado/inscripciones.json` y no vuelve a vigilar: así el arranque automático no sigue buscando en cada encendido.
+  `--repetir` lo ignora.
 - Al lograrlo (o si no puede) te avisa por mail y WhatsApp. Solo da el éxito por bueno si, al recargar, el SIU
   muestra la comisión como inscripta. Si falla 3 veces seguidas con cupo disponible (correlativas, fuera de
   período...), te avisa con el mensaje del SIU y corta.
@@ -227,7 +233,7 @@ sesión del SIU**, que guarda en `usuarios/<nombre>/` (ignorada por git: son ses
 .venv/Scripts/python siu_notas.py usuarios
 
 # a todos a la vez (los nuevos entran solos, sin tocar el comando):
-.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" --profesor "martin salaberri" --usuarios todos
+.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" "GIINFHACKAI" --profesor "martin salaberri" --usuarios todos
 # o solo a algunos:  --usuarios mateo,juani
 ```
 
@@ -244,6 +250,31 @@ sesión del SIU**, que guarda en `usuarios/<nombre>/` (ignorada por git: son ses
 - También sirve con un usuario suelto: `--usuario juani inscribir ...`, `--usuario juani check`, etc.
 - La tarea programada (`programar`) sigue siendo solo del usuario principal (sin `--usuario`).
 - Carga: con 3 usuarios son 3 consultas cada 5–10 s al servidor de la facultad. Usalo solo mientras haga falta.
+
+### Que arranque solo al prender la PC
+
+```bash
+.venv/Scripts/python siu_notas.py autoinicio "hackathon" "hack ai" "GIINFHACKAI" --profesor "martin salaberri" --usuarios todos
+```
+
+Crea una tarea de Windows ("SIU inscripcion") que lanza ese mismo `inscribir` **30 s después de que iniciás sesión**
+en Windows (para que arranque la red). Corre sin ventanas (`pythonw`), sin límite de tiempo, también con batería, y
+no se superpone con otra copia. No hace falta ser administrador.
+
+| Comando | Qué hace |
+|---|---|
+| `siu_notas.py autoinicio ALIAS... [--profesor X] [--usuarios todos]` | Crea o reemplaza la tarea (mismos argumentos que `inscribir`) |
+| `siu_notas.py autoinicio-iniciar` | La arranca ahora, sin esperar al próximo inicio de sesión |
+| `siu_notas.py autoinicio-estado` | Estado de la tarea y qué usuarios están vigilando, con su última línea del log |
+| `siu_notas.py autoinicio-quitar` | La elimina **y** corta lo que esté vigilando |
+
+- Con `--usuarios todos`, los usuarios que agregues después entran solos en el próximo arranque.
+- Cuando todos quedan anotados, el pedido se marca como cumplido y los próximos arranques terminan al instante.
+  Igual conviene `autoinicio-quitar` cuando ya no haga falta.
+- Necesita una **sesión de Windows iniciada**: no corre con la PC prendida pero sin loguearte (el perfil de Chromium
+  está atado a tu usuario). Si la PC se duerme, la vigilancia se pausa y sigue al despertar.
+- Si falla (sesión caída, 20 errores seguidos) avisa por mail/WhatsApp y termina: no reintenta en bucle.
+- Solo implementado para Windows (ver "Agregar otro sistema operativo": `programar_al_iniciar` en la interfaz).
 
 ### Dónde queda la sesión y cómo migrarla
 
