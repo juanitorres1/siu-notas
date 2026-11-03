@@ -159,7 +159,8 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 
 ### Seguridad y privacidad
 
-- **Solo lee.** En Inscripción a materias y a exámenes abre cada actividad para mirarla y **nunca** envía el formulario de "Inscribirse" ni "Dar de baja".
+- **`check` (la tarea programada) solo lee.** En Inscripción a materias y a exámenes abre cada actividad para mirarla y **nunca** envía el formulario de "Inscribirse" ni "Dar de baja".
+- **Lo único que escribe es `inscribir`**, y solo cuando lo corrés vos a mano (ver [Inscripción automática](#inscripción-automática-a-cursada)). Nunca da de baja.
 - `.env` (Gmail), `perfil/` (sesión de Microsoft), `estado/` (tus notas) y `capturas/` están en `.gitignore`. **No los subas nunca.**
 - Los mails salen de tu Gmail a vos. Ningún servicio externo ve tus notas.
 - Frecuencia razonable (cada hora, nada de noche) para no cargar el servidor de la facultad.
@@ -173,6 +174,7 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 | `.venv/Scripts/python siu_notas.py check` | Una revisión completa (lo que corre la tarea) |
 | `.venv/Scripts/python siu_notas.py test-mail` | Manda un mail de muestra con notas ya vistas |
 | `.venv/Scripts/python siu_notas.py test-whatsapp` | Manda un WhatsApp de prueba (si está configurado) |
+| `.venv/Scripts/python siu_notas.py inscribir "alias" ... [--profesor "x"] [--simular]` | Espera con polling a que la materia tenga cupo y se anota (ver abajo) |
 | `.venv/Scripts/python siu_notas.py login` | Abre Edge para loguearte a mano |
 | `.venv/Scripts/python siu_notas.py dump` | Guarda lo que lee en `capturas/filas.json` (para depurar) |
 | `.venv/Scripts/python siu_notas.py verificar` | Chequea los requisitos del sistema (navegador, venv) |
@@ -180,6 +182,60 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 | `./setup.sh programar` / `desprogramar` | Crear / borrar la tarea programada (usa `siu_notas.py programar` / `desprogramar`) |
 
 <sub>En macOS/Linux, el python del venv es `.venv/bin/python` en lugar de `.venv/Scripts/python`.</sub>
+
+## Inscripción automática a cursada
+
+Para materias donde el cupo vuela: `inscribir` consulta **Inscripción a materias** cada 5–10 segundos
+(al azar) y, apenas la materia aparece con cupo, se anota en la **primera comisión disponible**.
+Queda corriendo en la terminal hasta lograrlo o hasta que lo cortes con Ctrl+C.
+
+```bash
+.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" "hackathon ai" "hackathon ia" --profesor "martin salaberri"
+```
+
+- **Alias**: son nombres posibles de **la misma materia**. Matchean sin importar mayúsculas, tildes,
+  espacios o guiones (`hack ai` = `HackAI`), toleran typos (`hackthon` → Hackathon; **solo alias de 7+ letras**: con alias más cortos el parecido da falsos positivos, ej. `hackai` casi igualaba "Hacking Ético". Los alias cortos tienen que estar contenidos tal cual en el título)
+  y aceptan el código de la materia (`GIHACK`). Si dos materias distintas matchean igual, **no se anota
+  en ninguna** y te pide un alias más específico.
+- **`--profesor`** (opcional, último recurso): si ningún alias matchea con las materias abiertas, busca la
+  que tenga a ese docente en sus comisiones. Ignora las materias donde ya estás inscripto. Si el docente
+  aparece en varias materias, no elige: te avisa. Ojo: si el profesor dicta otra materia abierta en la que
+  todavía no estás anotado, esa también es candidata; usalo cuando no haya otra materia suya a la vista.
+- **`--simular`**: hace todo menos inscribirse. Dice qué comisión elegiría y si encontró el botón, y guarda la
+  página en `capturas/`. **Probalo primero con una materia que ya esté abierta.**
+- **`--intervalo 5-10`**: segundos entre consultas (mínimo 2).
+- Al lograrlo (o si no puede) te avisa por mail y WhatsApp. Solo da el éxito por bueno si, al recargar, el SIU
+  muestra la comisión como inscripta. Si falla 3 veces seguidas con cupo disponible (correlativas, fuera de
+  período...), te avisa con el mensaje del SIU y corta.
+- Mientras corre, la revisión horaria se saltea sola (las dos usan el mismo `perfil/` y no pueden a la vez).
+- Es la única parte del proyecto que **escribe** en el SIU. Usala con criterio: 5–10 s es agresivo para el
+  servidor de la facultad, así que corrélo solo cuando haga falta, no todo el día.
+
+### Varios usuarios en la misma PC
+
+Para anotar a varias personas a la misma materia desde una sola compu. Cada persona tiene su **propia
+sesión del SIU**, que guarda en `usuarios/<nombre>/` (ignorada por git: son sesiones de otras personas).
+
+```bash
+# una vez por persona, cada una con su cuenta y su MFA:
+.venv/Scripts/python siu_notas.py --usuario juani login
+.venv/Scripts/python siu_notas.py --usuario mateo login
+
+# a todos a la vez:
+.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" --profesor "martin salaberri" --usuarios mateo,juani,vito
+```
+
+- `--usuarios` lanza un `inscribir` independiente por persona (cada uno con su navegador, polling,
+  verificación y avisos) y muestra todo en la misma consola, con el prefijo `[juani]`, `[mateo]`.
+  Ctrl+C corta a todos. Al final imprime un resumen. Si a alguien le falta el `login`, no arranca y dice cuál.
+- El `login` crea `usuarios/<nombre>/.env` con las opciones comentadas. Lo que no definas ahí lo hereda del
+  `.env` principal (Gmail, navegador...). Útil para que cada uno reciba el aviso en **su** mail (`MAIL_TO`) o use
+  su propia `SIU_CARRERA`. Los mails siempre salen del Gmail del `.env` principal.
+- El WhatsApp es por teléfono: sin `WHATSAPP_TELEFONO`/`WHATSAPP_APIKEY` propios en el `.env` del usuario, su
+  aviso llega al WhatsApp principal. Los avisos llevan el nombre del usuario en el asunto: `SIU ▸ Inscripto ✅ (juani)`.
+- También sirve con un usuario suelto: `--usuario juani inscribir ...`, `--usuario juani check`, etc.
+- La tarea programada (`programar`) sigue siendo solo del usuario principal (sin `--usuario`).
+- Carga: con 3 usuarios son 3 consultas cada 5–10 s al servidor de la facultad. Usalo solo mientras haga falta.
 
 ## Problemas comunes
 

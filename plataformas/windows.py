@@ -1,5 +1,6 @@
 """Windows: Microsoft Edge + Programador de tareas (vía PowerShell)."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -43,7 +44,8 @@ class Windows(Plataforma):
 
     def verificar_requisitos(self) -> list[str]:
         problemas = []
-        if not any(p.exists() for p in EDGE):
+        # Con SIU_NAVEGADOR (ej. chromium) no se usa Edge, así que no hace falta.
+        if not os.getenv("SIU_NAVEGADOR") and not any(p.exists() for p in EDGE):
             problemas.append("No encontré Microsoft Edge instalado.")
         if not self.python_sin_consola.exists():
             problemas.append(f"No existe {self.python_sin_consola}: corré ./setup.sh primero.")
