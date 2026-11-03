@@ -175,7 +175,9 @@ El SIU de la Austral usa login de **Microsoft (SAML)**, con MFA. El monitor **nu
 | `.venv/Scripts/python siu_notas.py test-mail` | Manda un mail de muestra con notas ya vistas |
 | `.venv/Scripts/python siu_notas.py test-whatsapp` | Manda un WhatsApp de prueba (si está configurado) |
 | `.venv/Scripts/python siu_notas.py inscribir "alias" ... [--profesor "x"] [--simular]` | Espera con polling a que la materia tenga cupo y se anota (ver abajo) |
-| `.venv/Scripts/python siu_notas.py login` | Abre Edge para loguearte a mano |
+| `.venv/Scripts/python siu_notas.py login` | Abre el navegador para loguearte a mano (y guarda la sesión también en el `.env`) |
+| `.venv/Scripts/python siu_notas.py cookies` | Refresca `SIU_COOKIES` en el `.env` desde la sesión actual |
+| `.venv/Scripts/python siu_notas.py agregar-usuario NOMBRE` / `usuarios` | Suma una persona / lista las cargadas (ver [Varios usuarios](#varios-usuarios-en-la-misma-pc)) |
 | `.venv/Scripts/python siu_notas.py dump` | Guarda lo que lee en `capturas/filas.json` (para depurar) |
 | `.venv/Scripts/python siu_notas.py verificar` | Chequea los requisitos del sistema (navegador, venv) |
 | `tail -20 estado/siu.log` | Ver las últimas revisiones |
@@ -217,17 +219,23 @@ Para anotar a varias personas a la misma materia desde una sola compu. Cada pers
 sesión del SIU**, que guarda en `usuarios/<nombre>/` (ignorada por git: son sesiones de otras personas).
 
 ```bash
-# una vez por persona, cada una con su cuenta y su MFA:
-.venv/Scripts/python siu_notas.py --usuario juani login
-.venv/Scripts/python siu_notas.py --usuario mateo login
+# sumar una persona (abre su login, con su cuenta y su MFA). Repetir por cada una:
+.venv/Scripts/python siu_notas.py agregar-usuario juani
+.venv/Scripts/python siu_notas.py agregar-usuario mateo
 
-# a todos a la vez:
-.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" --profesor "martin salaberri" --usuarios mateo,juani,vito
+# ver quiénes están cargados:
+.venv/Scripts/python siu_notas.py usuarios
+
+# a todos a la vez (los nuevos entran solos, sin tocar el comando):
+.venv/Scripts/python siu_notas.py inscribir "hackathon" "hackaton" "hackthon" "hack ai" "hackai" "hack ia" "hackia" --profesor "martin salaberri" --usuarios todos
+# o solo a algunos:  --usuarios mateo,juani
 ```
 
+- **Sumar un usuario nuevo** = correr `agregar-usuario NOMBRE` una vez. No hay que editar nada: aparece en
+  `usuarios` y entra en `--usuarios todos`. (`agregar-usuario` es un atajo de `--usuario NOMBRE login`.)
 - `--usuarios` lanza un `inscribir` independiente por persona (cada uno con su navegador, polling,
   verificación y avisos) y muestra todo en la misma consola, con el prefijo `[juani]`, `[mateo]`.
-  Ctrl+C corta a todos. Al final imprime un resumen. Si a alguien le falta el `login`, no arranca y dice cuál.
+  Ctrl+C corta a todos. Al final imprime un resumen. Si a alguien le falta la sesión, no arranca y dice cuál.
 - El `login` crea `usuarios/<nombre>/.env` con las opciones comentadas. Lo que no definas ahí lo hereda del
   `.env` principal (Gmail, navegador...). Útil para que cada uno reciba el aviso en **su** mail (`MAIL_TO`) o use
   su propia `SIU_CARRERA`. Los mails siempre salen del Gmail del `.env` principal.
@@ -236,6 +244,23 @@ sesión del SIU**, que guarda en `usuarios/<nombre>/` (ignorada por git: son ses
 - También sirve con un usuario suelto: `--usuario juani inscribir ...`, `--usuario juani check`, etc.
 - La tarea programada (`programar`) sigue siendo solo del usuario principal (sin `--usuario`).
 - Carga: con 3 usuarios son 3 consultas cada 5–10 s al servidor de la facultad. Usalo solo mientras haga falta.
+
+### Dónde queda la sesión y cómo migrarla
+
+- Chromium guarda la sesión en `perfil/` (y `usuarios/<nombre>/perfil/`), en `Default/Network/Cookies`,
+  **cifrada con tu usuario de Windows**: copiar esa carpeta a otra PC no sirve.
+- Por eso `login` (y `agregar-usuario`) también guardan las cookies como **texto en el `.env` de ese usuario**
+  (`SIU_COOKIES`, ~7 KB; el del usuario principal va en el `.env` de la raíz). Si el perfil no tiene sesión del
+  SIU (carpeta nueva, o PC nueva), el programa arranca con esas cookies.
+- **Migrar a otra PC:** instalá el proyecto (`./setup.sh`) y copiá `.env` y `usuarios/*/.env`. No hace falta
+  copiar ninguna carpeta `perfil/`.
+- Para refrescar las cookies del `.env` antes de migrar: `siu_notas.py cookies` (o `--usuario NOMBRE cookies`).
+  Primero comprueba que la sesión siga viva.
+- Cada usuario lee solo **sus** cookies: nunca se heredan del `.env` principal (si no, entraría con la cuenta de otro).
+- ⚠️ `SIU_COOKIES` es una credencial en texto plano: con ese archivo cualquiera entra a tu SIU. No lo subas a git
+  (ya está ignorado), no lo pegues en chats ni issues y borrá el `.env` de las PCs que ya no uses.
+- Microsoft puede pedir un login nuevo si detecta otra PC u otra red: en ese caso `agregar-usuario NOMBRE`
+  vuelve a dejarlo listo.
 
 ## Problemas comunes
 

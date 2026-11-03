@@ -22,6 +22,7 @@ el paquete `plataformas`.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -33,13 +34,14 @@ import sys
 import time
 import traceback
 import unicodedata
+import zlib
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 import mail_ui as mail_ui_futurista
@@ -96,6 +98,9 @@ LOG_MAX = 1_000_000  # bytes; al pasarlo se queda con la segunda mitad
 if USUARIO:
     load_dotenv(RAIZ / ".env", override=True)
 load_dotenv(BASE / ".env")
+# Las cookies se leen siempre del archivo de CADA usuario (ver más abajo), nunca del entorno: así no se
+# heredan del .env principal, y el bloque de entorno de los procesos hijos no crece (en Windows tiene tope).
+os.environ.pop("SIU_COOKIES", None)
 # Con pythonw (tarea programada) no hay consola: sys.stdout es None.
 if sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -145,16 +150,108 @@ def comando_cli(*args: str) -> str:
     return plataforma().comando(*(("--usuario", USUARIO) if USUARIO else ()), *args)
 
 
+# ---------- cookies en el .env ----------
+# Chromium guarda la sesión en perfil/ cifrada con tu usuario de Windows: copiar esa carpeta a otra PC no
+# sirve. Por eso la sesión también se puede guardar como texto en el .env del usuario (SIU_COOKIES), y
+# alcanza con migrar ese archivo. Son credenciales en texto plano: tratalas como una contraseña.
+
+CLAVE_COOKIES = "SIU_COOKIES"
+NOMBRE_USUARIO = re.compile(r"[a-z0-9_-]+")
+
+
+def env_de(usuario: str) -> Path:
+    """.env de un usuario (el principal si `usuario` está vacío)."""
+    return BASE / "usuarios" / usuario / ".env" if usuario else BASE / ".env"
+
+
+ENV_USUARIO = env_de(USUARIO)
+
+
+def codificar_cookies(cookies: list[dict]) -> str:
+    return base64.b64encode(zlib.compress(json.dumps(cookies, separators=(",", ":")).encode("utf-8"), 9)).decode("ascii")
+
+
+def leer_cookies_env(env: Path) -> list[dict]:
+    """Cookies guardadas en ese .env (SIU_COOKIES). Se lee del ARCHIVO y no del entorno: un usuario sin
+    cookies propias jamás debe entrar con las de otro."""
+    crudo = (dotenv_values(env).get(CLAVE_COOKIES) or "").strip() if env.exists() else ""
+    if not crudo:
+        return []
+    try:
+        cookies = json.loads(zlib.decompress(base64.b64decode(crudo)).decode("utf-8"))
+        return cookies if isinstance(cookies, list) else []
+    except Exception:
+        log(f"{CLAVE_COOKIES} en {env.name} está dañado; lo ignoro (corré `login` o `cookies` de nuevo).")
+        return []
+
+
+def escribir_en_env(env: Path, clave: str, valor: str) -> None:
+    """Pone `clave=valor` en el .env: reemplaza la línea si existe, si no la agrega. No toca el resto."""
+    env.parent.mkdir(parents=True, exist_ok=True)
+    lineas = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
+    nueva = f"{clave}={valor}"
+    for i, linea in enumerate(lineas):
+        if re.match(rf"\s*{re.escape(clave)}\s*=", linea):
+            lineas[i] = nueva
+            break
+    else:
+        lineas.append(nueva)
+    env.write_text("\n".join(lineas) + "\n", encoding="utf-8")
+
+
+def guardar_cookies(ctx: BrowserContext) -> int:
+    """Guarda las cookies de la sesión abierta en el .env de este usuario. Devuelve cuántas."""
+    cookies = ctx.cookies()
+    escribir_en_env(ENV_USUARIO, CLAVE_COOKIES, codificar_cookies(cookies))
+    return len(cookies)
+
+
+_cookies_sembradas = False
+
+
+def sembrar_cookies(ctx: BrowserContext) -> bool:
+    """Carga en el navegador las cookies guardadas en el .env (una vez por proceso). True si cargó alguna."""
+    global _cookies_sembradas
+    cookies = [] if _cookies_sembradas else leer_cookies_env(ENV_USUARIO)
+    _cookies_sembradas = True
+    if not cookies:
+        return False
+    try:
+        ctx.add_cookies(cookies)
+    except Exception as e:
+        log(f"No pude cargar las cookies del .env ({type(e).__name__}: {str(e).splitlines()[0]}).")
+        return False
+    log(f"Cargué {len(cookies)} cookies guardadas en {ENV_USUARIO.relative_to(BASE).as_posix()}.")
+    return True
+
+
+def tiene_sesion(usuario: str) -> bool:
+    """¿Ese usuario tiene con qué entrar al SIU? (perfil de Chromium o cookies en su .env)"""
+    return (BASE / "usuarios" / usuario / "perfil").exists() or bool(leer_cookies_env(env_de(usuario)))
+
+
+def usuarios_existentes() -> list[str]:
+    carpeta = BASE / "usuarios"
+    if not carpeta.exists():
+        return []
+    return sorted(d.name for d in carpeta.iterdir()
+                  if d.is_dir() and NOMBRE_USUARIO.fullmatch(d.name) and tiene_sesion(d.name))
+
+
 # ---------- navegador ----------
 
-def abrir_contexto(p, headless: bool) -> BrowserContext:
+def abrir_contexto(p, headless: bool, sembrar: bool = True) -> BrowserContext:
     PERFIL.mkdir(parents=True, exist_ok=True)
     canal = os.getenv("SIU_NAVEGADOR") or plataforma().canal_navegador
     if canal.lower() == "chromium":
         canal = None  # el Chromium que descarga Playwright (`playwright install chromium`), no uno del sistema
-    return p.chromium.launch_persistent_context(
+    ctx = p.chromium.launch_persistent_context(
         str(PERFIL), channel=canal, headless=headless, locale="es-AR", viewport={"width": 1280, "height": 900}
     )
+    # Perfil sin sesión del SIU (nuevo, o migrado a otra PC con solo el .env): arranca con las cookies guardadas.
+    if sembrar and not any(c["domain"].lstrip(".").endswith("siu.austral.edu.ar") for c in ctx.cookies()):
+        sembrar_cookies(ctx)
+    return ctx
 
 
 def en_siu(url: str) -> bool:
@@ -170,8 +267,15 @@ def esta_logueado(page: Page) -> bool:
 
 
 def ir_al_inicio(page: Page) -> bool:
-    """Entra al inicio de alumno. Si la sesión del SIU venció, dispara el SSO de
-    Microsoft, que vuelve solo si la sesión de Microsoft sigue viva."""
+    """Entra al inicio de alumno. Si no hay sesión, prueba con las cookies guardadas en el .env (una vez)."""
+    if _entrar(page):
+        return True
+    return sembrar_cookies(page.context) and _entrar(page)
+
+
+def _entrar(page: Page) -> bool:
+    """Si la sesión del SIU venció, dispara el SSO de Microsoft, que vuelve solo si la sesión de Microsoft
+    sigue viva."""
     page.goto(INICIO, wait_until="networkidle")
     if esta_logueado(page):
         return True
@@ -784,18 +888,18 @@ PLANTILLA_ENV_USUARIO = """\
 # SIU_CARRERA=
 # WHATSAPP_TELEFONO=
 # WHATSAPP_APIKEY=
+# SIU_COOKIES (la sesión de ESTE usuario) lo escribe `login` / `cookies`. No se hereda: es de esta persona.
 """
 
 
 def cmd_login() -> None:
     if USUARIO:
         RAIZ.mkdir(parents=True, exist_ok=True)
-        env_usuario = RAIZ / ".env"
-        if not env_usuario.exists():
-            env_usuario.write_text(PLANTILLA_ENV_USUARIO, encoding="utf-8")
-            log(f"Creé {env_usuario.relative_to(BASE)} (opcional: MAIL_TO / SIU_CARRERA propios).")
+        if not ENV_USUARIO.exists():
+            ENV_USUARIO.write_text(PLANTILLA_ENV_USUARIO, encoding="utf-8")
+            log(f"Creé {ENV_USUARIO.relative_to(BASE)} (opcional: MAIL_TO / SIU_CARRERA propios).")
     with sync_playwright() as p:
-        ctx = abrir_contexto(p, headless=False)
+        ctx = abrir_contexto(p, headless=False, sembrar=False)  # login nuevo: no mezclar con cookies viejas
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{SIU}/acceso?auth=saml")
         print("\nLogueate en la ventana (MFA incluido) y elegí 'Mantener la sesión iniciada: Sí'.")
@@ -803,10 +907,56 @@ def cmd_login() -> None:
         page.wait_for_url(esta_logueado_url, timeout=300_000)
         page.wait_for_load_state("networkidle")
         if esta_logueado(page):
-            log(f"Sesión guardada en ./{PERFIL.relative_to(BASE).as_posix()}. Ya podés correr `check` o `inscribir`.")
+            n = guardar_cookies(ctx)
+            log(f"Sesión guardada en ./{PERFIL.relative_to(BASE).as_posix()} y {n} cookies en "
+                f"{ENV_USUARIO.relative_to(BASE).as_posix()} (para migrar solo con el .env). "
+                "Ya podés correr `check` o `inscribir`.")
         else:
             log(f"No parece logueado (url: {page.url}).")
         ctx.close()
+
+
+def cmd_cookies() -> None:
+    """Exporta la sesión actual al .env de este usuario (SIU_COOKIES). Sirve para refrescarlas antes de migrar."""
+    if inscripcion_en_curso():
+        sys.exit("Hay un `inscribir` usando este perfil: esperá a que termine.")
+    with sync_playwright() as p:
+        ctx = abrir_contexto(p, headless=True)
+        try:
+            if not ir_al_inicio(ctx.new_page()):
+                sys.exit(f"Sesión vencida: corré `{comando_cli('login')}` (el login ya guarda las cookies).")
+            n = guardar_cookies(ctx)
+        finally:
+            ctx.close()
+    log(f"{n} cookies guardadas en {ENV_USUARIO.relative_to(BASE).as_posix()} ({CLAVE_COOKIES}). "
+        "Son credenciales en texto plano: no pegues ni compartas ese archivo.")
+
+
+def cmd_usuarios() -> None:
+    """Lista los usuarios (carpetas en usuarios/) y qué tiene cada uno para entrar."""
+    nombres = usuarios_existentes()
+    if not nombres:
+        print("No hay usuarios. Agregá uno con: " + comando_cli("agregar-usuario", "NOMBRE"))
+        return
+    print(f"{'usuario':<16}{'perfil':<9}{'cookies en .env':<17}MAIL_TO propio")
+    for u in nombres:
+        env = env_de(u)
+        propio = (dotenv_values(env).get("MAIL_TO") or "-") if env.exists() else "-"
+        print(f"{u:<16}{'sí' if (BASE / 'usuarios' / u / 'perfil').exists() else '-':<9}"
+              f"{'sí' if leer_cookies_env(env) else '-':<17}{propio}")
+    print(f"\nTodos a la vez: {comando_cli('inscribir', 'ALIAS...', '--usuarios', 'todos')}")
+
+
+def cmd_agregar_usuario(argv: list[str]) -> None:
+    """`agregar-usuario NOMBRE`: abre el login de esa persona y deja su sesión lista (perfil + cookies en su .env)."""
+    if USUARIO:
+        sys.exit("agregar-usuario se usa sin --usuario.")
+    if len(argv) != 1 or not NOMBRE_USUARIO.fullmatch(argv[0]):
+        sys.exit("Uso: siu_notas.py agregar-usuario NOMBRE  (solo minúsculas, números, '-' y '_')")
+    nombre = argv[0]
+    if tiene_sesion(nombre):
+        log(f"'{nombre}' ya tiene sesión: la renuevo.")
+    sys.exit(subprocess.run([sys.executable, str(Path(__file__).resolve()), "--usuario", nombre, "login"]).returncode)
 
 
 def cmd_dump() -> None:
@@ -897,14 +1047,20 @@ def inscribir_varios(args: argparse.Namespace) -> None:
     sale con el prefijo [usuario]."""
     if USUARIO:
         sys.exit("--usuarios se usa sin --usuario (lanza un proceso por cada usuario).")
-    usuarios = list(dict.fromkeys(u.strip() for u in args.usuarios.split(",") if u.strip()))
-    invalidos = [u for u in usuarios if not re.fullmatch(r"[a-z0-9_-]+", u)]
+    if args.usuarios.strip().lower() == "todos":  # cada usuario nuevo entra solo, sin tocar este comando
+        usuarios = usuarios_existentes()
+        if not usuarios:
+            sys.exit("No hay usuarios con sesión. Agregá uno con: " + comando_cli("agregar-usuario", "NOMBRE"))
+    else:
+        usuarios = list(dict.fromkeys(u.strip() for u in args.usuarios.split(",") if u.strip()))
+    invalidos = [u for u in usuarios if not NOMBRE_USUARIO.fullmatch(u)]
     if not usuarios or invalidos:
-        sys.exit(f"--usuarios inválido ({invalidos or args.usuarios!r}): lista separada por comas, ej. juani,mateo.")
-    sin_sesion = [u for u in usuarios if not (BASE / "usuarios" / u / "perfil").exists()]
+        sys.exit(f"--usuarios inválido ({invalidos or args.usuarios!r}): lista separada por comas (ej. juani,mateo) o 'todos'.")
+    # Con perfil de Chromium o con cookies en su .env (migrado a otra PC) ya puede entrar.
+    sin_sesion = [u for u in usuarios if not tiene_sesion(u)]
     if sin_sesion:
         sys.exit("Falta iniciar sesión de: " + ", ".join(sin_sesion) + ". Corré, una vez por persona:\n"
-                 + "\n".join(f"    {plataforma().comando('--usuario', u, 'login')}" for u in sin_sesion))
+                 + "\n".join(f"    {plataforma().comando('agregar-usuario', u)}" for u in sin_sesion))
     base_cmd = [sys.executable, str(Path(__file__).resolve())]
     log(f"Lanzo la inscripción de {len(usuarios)} usuarios en paralelo: {', '.join(usuarios)}. Ctrl+C corta a todos.")
     hijos = []
@@ -941,7 +1097,7 @@ def cmd_inscribir(argv: list[str]) -> None:
     ap.add_argument("--profesor", default="", help="último recurso: si ningún alias aparece, busca materias de este docente")
     ap.add_argument("--simular", action="store_true", help="busca y dice qué haría, sin inscribirse")
     ap.add_argument("--intervalo", default="5-10", help="segundos entre consultas, 'min-max' al azar (por defecto 5-10)")
-    ap.add_argument("--usuarios", default="", help="varios usuarios a la vez, ej. juani,mateo (cada uno con su `--usuario X login`)")
+    ap.add_argument("--usuarios", default="", help="varios usuarios a la vez, ej. juani,mateo, o 'todos' (los de `usuarios`)")
     args = ap.parse_args(argv)
     try:
         extremos = [float(x) for x in args.intervalo.split("-")]
@@ -1315,6 +1471,8 @@ def cmd_desprogramar() -> None:
 if __name__ == "__main__":
     comandos = {
         "login": cmd_login,
+        "cookies": cmd_cookies,
+        "usuarios": cmd_usuarios,
         "check": check_con_aviso_de_error,
         "dump": cmd_dump,
         "test-mail": cmd_test_mail,
@@ -1325,7 +1483,9 @@ if __name__ == "__main__":
     }
     if len(sys.argv) >= 2 and sys.argv[1] == "inscribir":
         cmd_inscribir(sys.argv[2:])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "agregar-usuario":
+        cmd_agregar_usuario(sys.argv[2:])
     elif len(sys.argv) != 2 or sys.argv[1] not in comandos:
-        sys.exit(f"Uso: python siu_notas.py [{'|'.join([*comandos, 'inscribir'])}]")
+        sys.exit(f"Uso: python siu_notas.py [{'|'.join([*comandos, 'inscribir', 'agregar-usuario'])}]")
     else:
         comandos[sys.argv[1]]()
