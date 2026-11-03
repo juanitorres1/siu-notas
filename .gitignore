@@ -3,6 +3,7 @@
 __pycache__/
 # Sesión de Microsoft y datos académicos personales
 perfil/
+usuarios/
 estado/
 capturas/
 *.log

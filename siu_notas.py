@@ -7,6 +7,11 @@ el paquete `plataformas`.
   - `python siu_notas.py check`        -> headless: elige la carrera y lee parciales,
      Actuación provisoria, Historia académica y actividades con créditos; compara
      contra lo ya visto y manda un mail si hay novedades.
+  - `python siu_notas.py inscribir ALIAS... [--profesor X] [--simular]` -> polling cada 5-10 s
+     en Inscripción a materias y se anota en la primera comisión con cupo. Es el único
+     comando que ESCRIBE en el SIU; `check` sigue siendo solo lectura.
+  - `python siu_notas.py --usuario X <comando>` -> varios usuarios en la misma PC: sesión, estado y
+     log propios en usuarios/X/. `inscribir ... --usuarios a,b,c` los lanza a todos en paralelo.
   - `python siu_notas.py login`        -> abre el navegador para loguearte a mano (MFA).
   - `python siu_notas.py dump`         -> guarda lo leído en ./capturas/filas.json.
   - `python siu_notas.py test-mail`    -> prueba la config SMTP.
@@ -16,21 +21,27 @@ el paquete `plataformas`.
   - `python siu_notas.py desprogramar` -> la elimina.
 """
 
+import argparse
+import base64
 import hashlib
 import json
 import os
+import random
 import re
 import smtplib
+import subprocess
 import sys
 import time
 import traceback
 import unicodedata
+import zlib
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 import mail_ui as mail_ui_futurista
@@ -39,9 +50,32 @@ import plataformas
 import whatsapp
 
 BASE = Path(__file__).parent
-PERFIL = BASE / "perfil"
-ESTADO = BASE / "estado" / "snapshot.json"
-CAPTURAS = BASE / "capturas"
+
+
+def _usuario_de_argv() -> str:
+    """Varios usuarios en la misma PC: `siu_notas.py --usuario NOMBRE <comando>` (o la variable
+    SIU_USUARIO). Cada usuario tiene su propia sesión del SIU, estado, log y .env en usuarios/NOMBRE/.
+    Sin usuario, todo queda como siempre (perfil/, estado/, .env)."""
+    usuario = os.getenv("SIU_USUARIO", "").strip()
+    if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--usuario":
+        if len(sys.argv) < 3:
+            sys.exit("Falta el nombre: siu_notas.py --usuario NOMBRE <comando>")
+        usuario = sys.argv[2].strip()
+        del sys.argv[1:3]  # el resto del programa ve solo el comando
+    if usuario and not re.fullmatch(r"[a-z0-9_-]+", usuario):
+        sys.exit(f"Usuario inválido ({usuario!r}): solo minúsculas, números, '-' y '_'.")
+    return usuario
+
+
+USUARIO = _usuario_de_argv()
+RAIZ = BASE / "usuarios" / USUARIO if USUARIO else BASE
+PERFIL = RAIZ / "perfil"
+ESTADO = RAIZ / "estado" / "snapshot.json"
+CAPTURAS = RAIZ / "capturas"
+# Existe mientras `inscribir` corre (se "toca" en cada vuelta): la tarea programada
+# no puede abrir el mismo perfil al mismo tiempo, así que se salta esa revisión.
+LOCK_INSCRIPCION = RAIZ / "estado" / "inscribiendo.lock"
+LOCK_VIVO_SEG = 180
 
 SIU = "https://siu.austral.edu.ar/portal"
 INICIO = f"{SIU}/inicio_alumno"
@@ -56,10 +90,17 @@ TITULOS = {
 
 NOMBRE_TAREA = "SIU notas"
 
-LOG = BASE / "estado" / "siu.log"
+LOG = RAIZ / "estado" / "siu.log"
 LOG_MAX = 1_000_000  # bytes; al pasarlo se queda con la segunda mitad
 
+# El .env del usuario va primero y PISA lo heredado (override=True: un `inscribir --usuarios` lanza
+# hijos que ya traen el .env principal en su entorno); lo que no defina lo hereda del .env principal.
+if USUARIO:
+    load_dotenv(RAIZ / ".env", override=True)
 load_dotenv(BASE / ".env")
+# Las cookies se leen siempre del archivo de CADA usuario (ver más abajo), nunca del entorno: así no se
+# heredan del .env principal, y el bloque de entorno de los procesos hijos no crece (en Windows tiene tope).
+os.environ.pop("SIU_COOKIES", None)
 # Con pythonw (tarea programada) no hay consola: sys.stdout es None.
 if sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -81,10 +122,11 @@ def limpiar(texto: str) -> str:
 
 
 def log(msg: str) -> None:
-    linea = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    # Con usuario, la línea lo nombra: varias consolas/procesos comparten pantalla.
+    linea = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] " + (f"[{USUARIO}] " if USUARIO else "") + msg
     if sys.stdout:
         print(linea, flush=True)
-    LOG.parent.mkdir(exist_ok=True)
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     if LOG.exists() and LOG.stat().st_size > LOG_MAX:
         texto = LOG.read_text(encoding="utf-8", errors="ignore")
         LOG.write_text(texto[len(texto) // 2:], encoding="utf-8")
@@ -103,14 +145,113 @@ def plataforma() -> plataformas.Plataforma:
     return _plataforma
 
 
+def comando_cli(*args: str) -> str:
+    """Comando para mostrar al usuario (mails, mensajes); con usuario, incluye `--usuario X`."""
+    return plataforma().comando(*(("--usuario", USUARIO) if USUARIO else ()), *args)
+
+
+# ---------- cookies en el .env ----------
+# Chromium guarda la sesión en perfil/ cifrada con tu usuario de Windows: copiar esa carpeta a otra PC no
+# sirve. Por eso la sesión también se puede guardar como texto en el .env del usuario (SIU_COOKIES), y
+# alcanza con migrar ese archivo. Son credenciales en texto plano: tratalas como una contraseña.
+
+CLAVE_COOKIES = "SIU_COOKIES"
+NOMBRE_USUARIO = re.compile(r"[a-z0-9_-]+")
+
+
+def env_de(usuario: str) -> Path:
+    """.env de un usuario (el principal si `usuario` está vacío)."""
+    return BASE / "usuarios" / usuario / ".env" if usuario else BASE / ".env"
+
+
+ENV_USUARIO = env_de(USUARIO)
+
+
+def codificar_cookies(cookies: list[dict]) -> str:
+    return base64.b64encode(zlib.compress(json.dumps(cookies, separators=(",", ":")).encode("utf-8"), 9)).decode("ascii")
+
+
+def leer_cookies_env(env: Path) -> list[dict]:
+    """Cookies guardadas en ese .env (SIU_COOKIES). Se lee del ARCHIVO y no del entorno: un usuario sin
+    cookies propias jamás debe entrar con las de otro."""
+    crudo = (dotenv_values(env).get(CLAVE_COOKIES) or "").strip() if env.exists() else ""
+    if not crudo:
+        return []
+    try:
+        cookies = json.loads(zlib.decompress(base64.b64decode(crudo)).decode("utf-8"))
+        return cookies if isinstance(cookies, list) else []
+    except Exception:
+        log(f"{CLAVE_COOKIES} en {env.name} está dañado; lo ignoro (corré `login` o `cookies` de nuevo).")
+        return []
+
+
+def escribir_en_env(env: Path, clave: str, valor: str) -> None:
+    """Pone `clave=valor` en el .env: reemplaza la línea si existe, si no la agrega. No toca el resto."""
+    env.parent.mkdir(parents=True, exist_ok=True)
+    lineas = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
+    nueva = f"{clave}={valor}"
+    for i, linea in enumerate(lineas):
+        if re.match(rf"\s*{re.escape(clave)}\s*=", linea):
+            lineas[i] = nueva
+            break
+    else:
+        lineas.append(nueva)
+    env.write_text("\n".join(lineas) + "\n", encoding="utf-8")
+
+
+def guardar_cookies(ctx: BrowserContext) -> int:
+    """Guarda las cookies de la sesión abierta en el .env de este usuario. Devuelve cuántas."""
+    cookies = ctx.cookies()
+    escribir_en_env(ENV_USUARIO, CLAVE_COOKIES, codificar_cookies(cookies))
+    return len(cookies)
+
+
+_cookies_sembradas = False
+
+
+def sembrar_cookies(ctx: BrowserContext) -> bool:
+    """Carga en el navegador las cookies guardadas en el .env (una vez por proceso). True si cargó alguna."""
+    global _cookies_sembradas
+    cookies = [] if _cookies_sembradas else leer_cookies_env(ENV_USUARIO)
+    _cookies_sembradas = True
+    if not cookies:
+        return False
+    try:
+        ctx.add_cookies(cookies)
+    except Exception as e:
+        log(f"No pude cargar las cookies del .env ({type(e).__name__}: {str(e).splitlines()[0]}).")
+        return False
+    log(f"Cargué {len(cookies)} cookies guardadas en {ENV_USUARIO.relative_to(BASE).as_posix()}.")
+    return True
+
+
+def tiene_sesion(usuario: str) -> bool:
+    """¿Ese usuario tiene con qué entrar al SIU? (perfil de Chromium o cookies en su .env)"""
+    return (BASE / "usuarios" / usuario / "perfil").exists() or bool(leer_cookies_env(env_de(usuario)))
+
+
+def usuarios_existentes() -> list[str]:
+    carpeta = BASE / "usuarios"
+    if not carpeta.exists():
+        return []
+    return sorted(d.name for d in carpeta.iterdir()
+                  if d.is_dir() and NOMBRE_USUARIO.fullmatch(d.name) and tiene_sesion(d.name))
+
+
 # ---------- navegador ----------
 
-def abrir_contexto(p, headless: bool) -> BrowserContext:
-    PERFIL.mkdir(exist_ok=True)
+def abrir_contexto(p, headless: bool, sembrar: bool = True) -> BrowserContext:
+    PERFIL.mkdir(parents=True, exist_ok=True)
     canal = os.getenv("SIU_NAVEGADOR") or plataforma().canal_navegador
-    return p.chromium.launch_persistent_context(
+    if canal.lower() == "chromium":
+        canal = None  # el Chromium que descarga Playwright (`playwright install chromium`), no uno del sistema
+    ctx = p.chromium.launch_persistent_context(
         str(PERFIL), channel=canal, headless=headless, locale="es-AR", viewport={"width": 1280, "height": 900}
     )
+    # Perfil sin sesión del SIU (nuevo, o migrado a otra PC con solo el .env): arranca con las cookies guardadas.
+    if sembrar and not any(c["domain"].lstrip(".").endswith("siu.austral.edu.ar") for c in ctx.cookies()):
+        sembrar_cookies(ctx)
+    return ctx
 
 
 def en_siu(url: str) -> bool:
@@ -126,8 +267,15 @@ def esta_logueado(page: Page) -> bool:
 
 
 def ir_al_inicio(page: Page) -> bool:
-    """Entra al inicio de alumno. Si la sesión del SIU venció, dispara el SSO de
-    Microsoft, que vuelve solo si la sesión de Microsoft sigue viva."""
+    """Entra al inicio de alumno. Si no hay sesión, prueba con las cookies guardadas en el .env (una vez)."""
+    if _entrar(page):
+        return True
+    return sembrar_cookies(page.context) and _entrar(page)
+
+
+def _entrar(page: Page) -> bool:
+    """Si la sesión del SIU venció, dispara el SSO de Microsoft, que vuelve solo si la sesión de Microsoft
+    sigue viva."""
     page.goto(INICIO, wait_until="networkidle")
     if esta_logueado(page):
         return True
@@ -258,12 +406,14 @@ DIAS = (
 
 
 def _info_comision(materia: str, comision: str, cupo_txt: str, obs: str, inscripto: bool) -> dict:
-    cupo = re.search(r"(\d+)\s*\|\s*Inscriptos:\s*(\d+)", cupo_txt)
+    # "30 | Inscriptos: 12" o, sin tope, "Sin definir | Inscriptos: 26" (total = None).
+    cupo = re.search(r"([^|]*?)\s*\|\s*Inscriptos:\s*(\d+)", cupo_txt)
     creditos = re.search(r"(\d+(?:[.,]\d+)?)\s*cr[eé]ditos?", obs, re.I)
     asistencia = re.search(r"asistencia[^\d%]*(\d{1,3})\s*%", obs, re.I)
     lineas = [" ".join(l.split()) for l in obs.splitlines() if l.strip()]
     cuando = [l for l in lineas if re.search(DIAS, l, re.I) or re.search(r"\b\d{1,2}/\d{1,2}\b", l)]
-    total, inscriptos = (int(cupo.group(1)), int(cupo.group(2))) if cupo else (None, None)
+    total = int(cupo.group(1)) if cupo and cupo.group(1).strip().isdigit() else None
+    inscriptos = int(cupo.group(2)) if cupo else None
     return {
         "materia": materia,
         "comision": comision,
@@ -278,39 +428,58 @@ def _info_comision(materia: str, comision: str, cupo_txt: str, obs: str, inscrip
     }
 
 
+def links_cursada(page: Page) -> list[tuple[str, str]]:
+    """[(título, href)] de las materias de Inscripción a materias. Va a /cursada (GET)."""
+    page.goto(f"{SIU}/cursada", wait_until="networkidle")
+    return list(dict(page.eval_on_selector_all(
+        "a[href*='/cursada/elegir_materia/']", "as => as.map(a => [a.title, a.href])"
+    )).items())
+
+
+def nombre_materia(titulo: str) -> str:
+    return re.sub(r"\s*-\s*\(", " (", titulo)  # "Ayudantía 6 - (COD)" -> "Ayudantía 6 (COD)"
+
+
+def leer_comisiones(page: Page, titulo: str) -> list[dict]:
+    """Comisiones de la materia que ya está abierta en `page` (cursada/elegir_materia/<id>).
+    Cada una trae `indice` (posición entre las `li.comision`) y `docentes`. Solo lee."""
+    materia = nombre_materia(titulo)
+    crudas = page.eval_on_selector_all(
+        "#comisiones li.comision",
+        """lis => lis.map((li, i) => {
+            const campo = (nombres, crudo = false, ausente = '') => {
+                for (const row of li.querySelectorAll('.row-fluid')) {
+                    const k = row.querySelector('.span3');
+                    const t = k ? k.innerText.trim().toLowerCase() : '';
+                    if (nombres.some(n => t.startsWith(n)))
+                        { const v = row.querySelector('.span9'); return (crudo ? v?.textContent : v?.innerText) ?? ''; }
+                }
+                return ausente;
+            };
+            return [
+                (li.querySelector('h4')?.innerText ?? '').replace(/^\\s*Comisi[oó]n:\\s*/, '').trim(),
+                campo(['cupo']), campo(['observaciones'], true),
+                !li.classList.contains('no-inscripto'),
+                i,
+                // Fila "Docentes:" (puede estar vacía). Solo si la página no la tiene, el texto entero de la comisión.
+                campo(['docente', 'profesor'], false, null) ?? li.innerText,
+            ];
+        })""",
+    )
+    comisiones = []
+    for comision, cupo, obs, inscripto, indice, docentes in crudas:
+        info = _info_comision(materia, comision, cupo, obs, inscripto)
+        comisiones.append({**info, "indice": indice, "docentes": " ".join(docentes.split())})
+    return comisiones
+
+
 def leer_creditos(page: Page) -> list[dict]:
     """Comisiones de Inscripción a materias que dan créditos (según 'Observaciones').
     Solo lee: entra a cursada/elegir_materia/<id> (GET) y NUNCA envía el form de inscripción."""
-    page.goto(f"{SIU}/cursada", wait_until="networkidle")
-    links = page.eval_on_selector_all(
-        "a[href*='/cursada/elegir_materia/']", "as => as.map(a => [a.title, a.href])"
-    )
     comisiones = []
-    for titulo, href in dict(links).items():
+    for titulo, href in links_cursada(page):
         page.goto(href, wait_until="networkidle")
-        materia = re.sub(r"\s*-\s*\(", " (", titulo)  # "Ayudantía 6 - (COD)" -> "Ayudantía 6 (COD)"
-        crudas = page.eval_on_selector_all(
-            "#comisiones li.comision",
-            """lis => lis.map(li => {
-                const campo = (nombre, crudo = false) => {
-                    for (const row of li.querySelectorAll('.row-fluid')) {
-                        const k = row.querySelector('.span3');
-                        if (k && k.innerText.trim().toLowerCase().startsWith(nombre))
-                            { const v = row.querySelector('.span9'); return (crudo ? v?.textContent : v?.innerText) ?? ''; }
-                    }
-                    return '';
-                };
-                return [
-                    (li.querySelector('h4')?.innerText ?? '').replace(/^\\s*Comisi[oó]n:\\s*/, '').trim(),
-                    campo('cupo'), campo('observaciones', true),
-                    !li.classList.contains('no-inscripto'),
-                ];
-            })""",
-        )
-        for comision, cupo, obs, inscripto in crudas:
-            info = _info_comision(materia, comision, cupo, obs, inscripto)
-            if info["creditos"]:
-                comisiones.append(info)
+        comisiones += [c for c in leer_comisiones(page, titulo) if c["creditos"]]
     return comisiones
 
 
@@ -564,6 +733,113 @@ def leer_todo(page: Page) -> dict:
     }
 
 
+# ---------- inscripción automática (único código que ESCRIBE en el SIU) ----------
+
+class Ambiguo(RuntimeError):
+    """Más de una materia matchea con la misma fuerza: no se adivina."""
+
+
+def compacto(texto: str) -> str:
+    """Solo letras y números en minúscula: 'Hack AI' y 'HackAI' quedan iguales."""
+    return re.sub(r"[^a-z0-9]", "", normalizar(texto))
+
+
+def coincide(titulo: str, alias: str) -> float:
+    """Qué tan bien el alias describe el título de la materia (0 = no coincide, 1 = exacto).
+    Acepta el código ('GIHACK'), el nombre en cualquier forma ('hack ai') y typos ('hackthon')."""
+    a, t = compacto(alias), compacto(titulo)
+    if not a:
+        return 0.0
+    codigo = re.search(r"\(([^()]+)\)\s*$", titulo)
+    if (codigo and compacto(codigo.group(1)) == a) or a in t:
+        return 1.0
+    # Con alias cortos el difuso da falsos positivos: "hackai" ~ "hacki|ng" (Hacking Ético) llegaba a 0.91.
+    # Solo se toleran typos en alias largos, y con ventanas de largo casi igual al alias.
+    if len(a) < 7:
+        return 0.0
+    mejor = 0.0
+    for largo in range(len(a) - 1, len(a) + 2):
+        for i in range(len(t) - largo + 1):
+            mejor = max(mejor, SequenceMatcher(None, a, t[i:i + largo]).ratio())
+    return mejor if mejor >= 0.85 else 0.0
+
+
+def docente_coincide(texto: str, profesor: str) -> bool:
+    """Todas las palabras del nombre aparecen en el texto, en cualquier orden y sin tildes
+    ('Salaberri, Martín' == 'martin salaberri')."""
+    palabras = re.findall(r"[a-z0-9]+", normalizar(profesor))
+    presentes = set(re.findall(r"[a-z0-9]+", normalizar(texto)))
+    return bool(palabras) and all(p in presentes for p in palabras)
+
+
+def buscar_materia(links: list[tuple[str, str]], aliases: list[str]) -> tuple[str, str] | None:
+    """La materia de `links` [(título, href)] que mejor matchea con algún alias.
+    Si varias empatan en el mejor puntaje, lanza Ambiguo en vez de elegir una."""
+    puntajes = [(max(coincide(t, a) for a in aliases), t, h) for t, h in links]
+    mejor = max((p for p, _, _ in puntajes), default=0.0)
+    if mejor == 0.0:
+        return None
+    ganadoras = [(t, h) for p, t, h in puntajes if p == mejor]
+    if len(ganadoras) > 1:
+        raise Ambiguo("Varias materias matchean igual: " + "; ".join(t for t, _ in ganadoras)
+                      + ". Usá un alias más específico (o el código entre paréntesis).")
+    return ganadoras[0]
+
+
+def elegir_comision(comisiones: list[dict]) -> dict | None:
+    """La primera comisión con cupo (o con cupo desconocido) a la que todavía no estás inscripto."""
+    return next((c for c in comisiones if not c["inscripto"] and c["quedan"] != 0), None)
+
+
+def guardar_captura(page: Page, nombre: str) -> str:
+    """Screenshot + HTML de la página actual en ./capturas, para depurar. Devuelve el prefijo."""
+    CAPTURAS.mkdir(parents=True, exist_ok=True)
+    base = CAPTURAS / f"{nombre}_{datetime.now():%Y%m%d_%H%M%S}"
+    try:
+        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        base.with_suffix(".html").write_text(page.content(), encoding="utf-8")
+    except Exception as e:
+        log(f"No pude guardar la captura: {e}")
+    return str(base)
+
+
+def boton_inscripcion(page: Page, indice: int):
+    """Locator del botón 'Inscribirse' dentro de la comisión nº `indice` (puede no existir).
+    'Dar de baja' / 'Desinscribirse' nunca matchean."""
+    li = page.locator("#comisiones li.comision").nth(indice)
+    patron = re.compile(r"^(?!.*(baja|desinscri)).*inscrib", re.I)
+    return li.get_by_role("button", name=patron).or_(li.get_by_role("link", name=patron))
+
+
+def inscribir_en_comision(page: Page, titulo: str, href: str, comision: dict) -> tuple[bool, str]:
+    """Aprieta 'Inscribirse' en la comisión elegida (la página de la materia ya está abierta).
+    Devuelve (ok, mensaje). Solo cuenta como éxito si, al recargar, el SIU la muestra como
+    inscripta: el click por sí solo no prueba nada."""
+    boton = boton_inscripcion(page, comision["indice"])
+    if boton.count() == 0:
+        return False, f"No encontré el botón de inscripción (capturas: {guardar_captura(page, 'inscripcion_sin_boton')})"
+    boton.first.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+    # Algunos formularios piden confirmar en un modal.
+    confirmar = page.locator(".modal:visible, .bootbox:visible").get_by_role(
+        "button", name=re.compile(r"^\s*(aceptar|confirmar|inscribirse|inscribir|s[ií])\s*$", re.I))
+    if confirmar.count():
+        confirmar.first.click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
+    mensajes = [" ".join(t.split()) for t in page.locator(".alert").all_inner_texts() if t.strip()]
+    mensaje_siu = " | ".join(dict.fromkeys(mensajes))
+    page.goto(href, wait_until="networkidle")
+    # Ya inscripta, el SIU cambia el título de la comisión por "Estás inscripto en ..." (queda sin
+    # nombre), así que no se puede comparar por nombre. Antes del click no había ninguna inscripta
+    # (cmd_inscribir lo verifica), por lo que alguna inscripta ahora significa que se anotó.
+    if any(c["inscripto"] for c in leer_comisiones(page, titulo)):
+        return True, mensaje_siu
+    donde = guardar_captura(page, "inscripcion_fallida")
+    return False, f"{mensaje_siu or 'el SIU no confirmó la inscripción'} (capturas: {donde})"
+
+
 # ---------- estado y mail ----------
 
 def cargar_estado() -> dict:
@@ -573,7 +849,7 @@ def cargar_estado() -> dict:
 
 
 def guardar_estado(estado: dict) -> None:
-    ESTADO.parent.mkdir(exist_ok=True)
+    ESTADO.parent.mkdir(parents=True, exist_ok=True)
     ESTADO.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -605,9 +881,25 @@ def enviar_mail(
 
 # ---------- comandos ----------
 
+PLANTILLA_ENV_USUARIO = """\
+# Config de este usuario. Lo que no definas acá lo hereda del .env principal (SMTP, navegador, etc.).
+# Descomentá y completá solo lo que sea distinto:
+# MAIL_TO=
+# SIU_CARRERA=
+# WHATSAPP_TELEFONO=
+# WHATSAPP_APIKEY=
+# SIU_COOKIES (la sesión de ESTE usuario) lo escribe `login` / `cookies`. No se hereda: es de esta persona.
+"""
+
+
 def cmd_login() -> None:
+    if USUARIO:
+        RAIZ.mkdir(parents=True, exist_ok=True)
+        if not ENV_USUARIO.exists():
+            ENV_USUARIO.write_text(PLANTILLA_ENV_USUARIO, encoding="utf-8")
+            log(f"Creé {ENV_USUARIO.relative_to(BASE)} (opcional: MAIL_TO / SIU_CARRERA propios).")
     with sync_playwright() as p:
-        ctx = abrir_contexto(p, headless=False)
+        ctx = abrir_contexto(p, headless=False, sembrar=False)  # login nuevo: no mezclar con cookies viejas
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{SIU}/acceso?auth=saml")
         print("\nLogueate en la ventana (MFA incluido) y elegí 'Mantener la sesión iniciada: Sí'.")
@@ -615,14 +907,60 @@ def cmd_login() -> None:
         page.wait_for_url(esta_logueado_url, timeout=300_000)
         page.wait_for_load_state("networkidle")
         if esta_logueado(page):
-            log("Sesión guardada en ./perfil. Ya podés correr `check`.")
+            n = guardar_cookies(ctx)
+            log(f"Sesión guardada en ./{PERFIL.relative_to(BASE).as_posix()} y {n} cookies en "
+                f"{ENV_USUARIO.relative_to(BASE).as_posix()} (para migrar solo con el .env). "
+                "Ya podés correr `check` o `inscribir`.")
         else:
             log(f"No parece logueado (url: {page.url}).")
         ctx.close()
 
 
+def cmd_cookies() -> None:
+    """Exporta la sesión actual al .env de este usuario (SIU_COOKIES). Sirve para refrescarlas antes de migrar."""
+    if inscripcion_en_curso():
+        sys.exit("Hay un `inscribir` usando este perfil: esperá a que termine.")
+    with sync_playwright() as p:
+        ctx = abrir_contexto(p, headless=True)
+        try:
+            if not ir_al_inicio(ctx.new_page()):
+                sys.exit(f"Sesión vencida: corré `{comando_cli('login')}` (el login ya guarda las cookies).")
+            n = guardar_cookies(ctx)
+        finally:
+            ctx.close()
+    log(f"{n} cookies guardadas en {ENV_USUARIO.relative_to(BASE).as_posix()} ({CLAVE_COOKIES}). "
+        "Son credenciales en texto plano: no pegues ni compartas ese archivo.")
+
+
+def cmd_usuarios() -> None:
+    """Lista los usuarios (carpetas en usuarios/) y qué tiene cada uno para entrar."""
+    nombres = usuarios_existentes()
+    if not nombres:
+        print("No hay usuarios. Agregá uno con: " + comando_cli("agregar-usuario", "NOMBRE"))
+        return
+    print(f"{'usuario':<16}{'perfil':<9}{'cookies en .env':<17}MAIL_TO propio")
+    for u in nombres:
+        env = env_de(u)
+        propio = (dotenv_values(env).get("MAIL_TO") or "-") if env.exists() else "-"
+        print(f"{u:<16}{'sí' if (BASE / 'usuarios' / u / 'perfil').exists() else '-':<9}"
+              f"{'sí' if leer_cookies_env(env) else '-':<17}{propio}")
+    print(f"\nTodos a la vez: {comando_cli('inscribir', 'ALIAS...', '--usuarios', 'todos')}")
+
+
+def cmd_agregar_usuario(argv: list[str]) -> None:
+    """`agregar-usuario NOMBRE`: abre el login de esa persona y deja su sesión lista (perfil + cookies en su .env)."""
+    if USUARIO:
+        sys.exit("agregar-usuario se usa sin --usuario.")
+    if len(argv) != 1 or not NOMBRE_USUARIO.fullmatch(argv[0]):
+        sys.exit("Uso: siu_notas.py agregar-usuario NOMBRE  (solo minúsculas, números, '-' y '_')")
+    nombre = argv[0]
+    if tiene_sesion(nombre):
+        log(f"'{nombre}' ya tiene sesión: la renuevo.")
+    sys.exit(subprocess.run([sys.executable, str(Path(__file__).resolve()), "--usuario", nombre, "login"]).returncode)
+
+
 def cmd_dump() -> None:
-    CAPTURAS.mkdir(exist_ok=True)
+    CAPTURAS.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         ctx = abrir_contexto(p, headless=True)
         page = ctx.new_page()
@@ -635,6 +973,238 @@ def cmd_dump() -> None:
     log(", ".join(f"{k}: {len(v)} filas" for k, v in datos.items()) + f" -> {CAPTURAS}")
 
 
+def inscripcion_en_curso() -> bool:
+    """¿Hay un `inscribir` vivo? (el lock se toca en cada vuelta; uno viejo es de un proceso muerto)."""
+    try:
+        return time.time() - LOCK_INSCRIPCION.stat().st_mtime < LOCK_VIVO_SEG
+    except FileNotFoundError:
+        return False
+
+
+class SesionCaida(RuntimeError):
+    pass
+
+
+REFRESCO_DOCENTES_SEG = 600   # cada cuánto se vuelven a leer los docentes de todas las materias
+LATIDO_SEG = 300              # cada cuánto repetir en el log "sigo esperando" si nada cambió
+ESPERA_ERROR_SEG = 30
+ERRORES_PARA_RENDIRSE = 20
+INTENTOS_FALLIDOS_PARA_RENDIRSE = 3
+
+
+def localizar_materia(page: Page, aliases: list[str], profesor: str, cache: dict) -> tuple[tuple[str, str] | None, str]:
+    """(materia, motivo_de_espera). Primero por alias; si no aparece y hay `profesor`, por docente
+    (último recurso). `cache` guarda los docentes ya leídos para no abrir todas las materias en cada vuelta."""
+    links = links_cursada(page)
+    if not esta_logueado(page):
+        raise SesionCaida()
+    if not links:
+        return None, "Inscripción a materias no tiene ninguna materia abierta"
+    encontrada = buscar_materia(links, aliases)
+    if encontrada:
+        return encontrada, ""
+    if not profesor:
+        return None, f"ninguna de las {len(links)} materias abiertas matchea con {aliases}"
+    if time.time() - cache.get("ts", 0) > REFRESCO_DOCENTES_SEG:
+        cache.update(ts=time.time(), docentes={})
+    docentes = cache.setdefault("docentes", {})
+    for titulo, href in links:
+        if href not in docentes:
+            page.goto(href, wait_until="networkidle")
+            comisiones = leer_comisiones(page, titulo)
+            docentes[href] = (" ".join(c["docentes"] for c in comisiones), any(c["inscripto"] for c in comisiones))
+    # Las materias donde ya estás inscripto no pueden ser el objetivo: sin esto, un profesor que dicta
+    # otra materia tuya haría creer que ya estás anotado (o te anotaría en la que no es).
+    candidatas = [(t, h) for t, h in links if docente_coincide(docentes[h][0], profesor) and not docentes[h][1]]
+    if len(candidatas) == 1:
+        if cache.get("via_profesor") != candidatas[0][1]:
+            cache["via_profesor"] = candidatas[0][1]
+            log(f"No matcheó ningún alias; la encontré por el profesor '{profesor}': {candidatas[0][0]}")
+        return candidatas[0], ""
+    if candidatas:
+        return None, ("ambiguo: el profesor aparece en varias materias (" + "; ".join(t for t, _ in candidatas)
+                      + "); no me anoto en ninguna sin que un alias la identifique")
+    return None, f"ningún alias matchea y '{profesor}' no dicta ninguna de las {len(links)} materias abiertas"
+
+
+def avisar_inscripcion(titulo: str, mensaje: str, detalle: str) -> None:
+    """Mail + WhatsApp. El WhatsApp pasa por CallMeBot: sin WHATSAPP_DETALLE=completo no lleva el nombre de la materia.
+    Con varios usuarios, el título dice de quién es el aviso."""
+    if USUARIO:
+        titulo = f"{titulo} ({USUARIO})"
+    try:
+        enviar_mail(f"SIU ▸ {titulo}", f"{mensaje}\n\n{detalle}\n\n{SIU}/cursada",
+                    mail_ui.html_aviso(titulo, mensaje, detalle, f"{SIU}/cursada"))
+    except Exception as e:
+        log(f"No pude mandar el mail: {e}")
+    avisar_whatsapp(f"*SIU ▸ {titulo}*\n" + (f"{mensaje}\n{detalle}" if whatsapp.detalle_completo()
+                                              else "El detalle está en tu mail."))
+
+
+def inscribir_varios(args: argparse.Namespace) -> None:
+    """`inscribir --usuarios a,b,c`: un `inscribir` por usuario, en paralelo y en procesos aparte
+    (cada uno con su sesión, polling, verificación y avisos). Comparten la consola; cada línea
+    sale con el prefijo [usuario]."""
+    if USUARIO:
+        sys.exit("--usuarios se usa sin --usuario (lanza un proceso por cada usuario).")
+    if args.usuarios.strip().lower() == "todos":  # cada usuario nuevo entra solo, sin tocar este comando
+        usuarios = usuarios_existentes()
+        if not usuarios:
+            sys.exit("No hay usuarios con sesión. Agregá uno con: " + comando_cli("agregar-usuario", "NOMBRE"))
+    else:
+        usuarios = list(dict.fromkeys(u.strip() for u in args.usuarios.split(",") if u.strip()))
+    invalidos = [u for u in usuarios if not NOMBRE_USUARIO.fullmatch(u)]
+    if not usuarios or invalidos:
+        sys.exit(f"--usuarios inválido ({invalidos or args.usuarios!r}): lista separada por comas (ej. juani,mateo) o 'todos'.")
+    # Con perfil de Chromium o con cookies en su .env (migrado a otra PC) ya puede entrar.
+    sin_sesion = [u for u in usuarios if not tiene_sesion(u)]
+    if sin_sesion:
+        sys.exit("Falta iniciar sesión de: " + ", ".join(sin_sesion) + ". Corré, una vez por persona:\n"
+                 + "\n".join(f"    {plataforma().comando('agregar-usuario', u)}" for u in sin_sesion))
+    base_cmd = [sys.executable, str(Path(__file__).resolve())]
+    log(f"Lanzo la inscripción de {len(usuarios)} usuarios en paralelo: {', '.join(usuarios)}. Ctrl+C corta a todos.")
+    hijos = []
+    for u in usuarios:
+        # "--" antes de los alias: uno que empiece con "-" no se confunde con una opción.
+        cmd = [*base_cmd, "--usuario", u, "inscribir", "--intervalo", args.intervalo]
+        cmd += ["--profesor", args.profesor] if args.profesor else []
+        cmd += ["--simular"] if args.simular else []
+        hijos.append((u, subprocess.Popen([*cmd, "--", *args.aliases])))
+    codigos: dict[str, int] = {}
+    try:
+        for u, proceso in hijos:
+            codigos[u] = proceso.wait()
+    except KeyboardInterrupt:
+        # Ctrl+C también llegó a los hijos (misma consola): les damos tiempo a cerrar su navegador y su lock.
+        for u, proceso in hijos:
+            try:
+                codigos[u] = proceso.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proceso.terminate()
+                codigos[u] = proceso.wait()
+    log("Resumen: " + " · ".join(f"{u}: {'terminó' if c == 0 else f'falló (código {c})'}" for u, c in codigos.items())
+        + ". El detalle de cada uno está arriba y en usuarios/<usuario>/estado/siu.log.")
+    if any(codigos.values()):
+        sys.exit(1)
+
+
+def cmd_inscribir(argv: list[str]) -> None:
+    ap = argparse.ArgumentParser(
+        prog="siu_notas.py inscribir",
+        description="Espera (polling) a que la materia aparezca en Inscripción a materias con cupo y se anota "
+                    "en la primera comisión disponible. Es lo único de este proyecto que escribe en el SIU.")
+    ap.add_argument("aliases", nargs="+", help="nombres posibles de la MISMA materia (nombre, variantes, typos o código)")
+    ap.add_argument("--profesor", default="", help="último recurso: si ningún alias aparece, busca materias de este docente")
+    ap.add_argument("--simular", action="store_true", help="busca y dice qué haría, sin inscribirse")
+    ap.add_argument("--intervalo", default="5-10", help="segundos entre consultas, 'min-max' al azar (por defecto 5-10)")
+    ap.add_argument("--usuarios", default="", help="varios usuarios a la vez, ej. juani,mateo, o 'todos' (los de `usuarios`)")
+    args = ap.parse_args(argv)
+    try:
+        extremos = [float(x) for x in args.intervalo.split("-")]
+        minimo, maximo = extremos[0], extremos[-1]
+        if len(extremos) > 2 or not 2 <= minimo <= maximo:
+            raise ValueError
+    except ValueError:
+        ap.error("--intervalo tiene que ser 'min-max' en segundos, con min >= 2 (ej. 5-10)")
+    if args.usuarios:
+        return inscribir_varios(args)
+    if inscripcion_en_curso():
+        sys.exit("Ya hay un `inscribir` corriendo (estado/inscribiendo.lock). Cortalo antes de lanzar otro.")
+
+    LOCK_INSCRIPCION.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_INSCRIPCION.touch()
+    log(f"Inscripción automática{' (SIMULACIÓN)' if args.simular else ''}: alias={args.aliases}"
+        + (f", profesor='{args.profesor}'" if args.profesor else "") + f", cada {minimo:g}-{maximo:g} s. Ctrl+C para cortar.")
+    cache: dict = {}
+    previo, ultimo_log = "", 0.0
+    errores = intentos_fallidos = 0
+    try:
+        with sync_playwright() as p:
+            ctx = abrir_contexto(p, headless=True)
+            page = ctx.new_page()
+            try:
+                if not ir_al_inicio(page):
+                    sys.exit(f"Sesión vencida: corré `{comando_cli('login')}`.")
+                elegir_carrera(page)
+                while True:
+                    LOCK_INSCRIPCION.touch()
+                    motivo = ""
+                    try:
+                        objetivo, motivo = localizar_materia(page, args.aliases, args.profesor, cache)
+                        if objetivo:
+                            titulo, href = objetivo
+                            page.goto(href, wait_until="networkidle")
+                            comisiones = leer_comisiones(page, titulo)
+                            materia = nombre_materia(titulo)
+                            ya = next((c for c in comisiones if c["inscripto"]), None)
+                            elegida = elegir_comision(comisiones)
+                            if ya:
+                                log(f"Ya estás inscripto en {materia}, comisión '{ya['comision']}'. No hago nada.")
+                                return
+                            if not comisiones:
+                                motivo = f"{materia} existe pero todavía no tiene comisiones"
+                            elif not elegida:
+                                motivo = f"{materia}: {len(comisiones)} comisión(es), ninguna con cupo"
+                            elif args.simular:
+                                boton = boton_inscripcion(page, elegida["indice"]).count()
+                                cupo = "cupo sin definir" if elegida["quedan"] is None else f"quedan {elegida['quedan']}"
+                                log(f"[SIMULACIÓN] Me anotaría en {materia}, comisión '{elegida['comision']}' "
+                                    f"({cupo}, {elegida['inscriptos']} inscriptos). "
+                                    f"Botón de inscripción: {'encontrado' if boton else 'NO ENCONTRADO'}. "
+                                    f"Página guardada en {guardar_captura(page, 'simulacion')}")
+                                return
+                            else:
+                                log(f"Hay cupo en {materia}, comisión '{elegida['comision']}': me inscribo.")
+                                ok, mensaje = inscribir_en_comision(page, titulo, href, elegida)
+                                if ok:
+                                    log(f"Inscripto en {materia}, comisión '{elegida['comision']}'. SIU: {mensaje or '-'}")
+                                    avisar_inscripcion("Inscripto ✅", f"Te anoté en {materia}.",
+                                                       f"Comisión {elegida['comision']}")
+                                    return
+                                intentos_fallidos += 1
+                                log(f"No pude inscribirme ({intentos_fallidos}/{INTENTOS_FALLIDOS_PARA_RENDIRSE}): {mensaje}")
+                                if intentos_fallidos >= INTENTOS_FALLIDOS_PARA_RENDIRSE:
+                                    avisar_inscripcion(
+                                        "No pude inscribirme", f"Había cupo en {materia} pero el SIU no me dejó anotarme.",
+                                        mensaje)
+                                    sys.exit(1)
+                                motivo = "reintentando la inscripción"
+                        errores = 0
+                    except SesionCaida:
+                        log("Se cayó la sesión; reintento entrar.")
+                        if not ir_al_inicio(page):
+                            avisar_inscripcion("Sesión caída", "Se cayó la sesión del SIU mientras esperaba la inscripción.",
+                                               comando_cli("login"))
+                            sys.exit(2)
+                        elegir_carrera(page)
+                        continue
+                    except Ambiguo as e:
+                        sys.exit(f"{e}")
+                    except Exception as e:
+                        errores += 1
+                        log(f"Error pasajero {errores}/{ERRORES_PARA_RENDIRSE} ({type(e).__name__}: {str(e).splitlines()[0]}).")
+                        if errores >= ERRORES_PARA_RENDIRSE:
+                            avisar_inscripcion("Inscripción automática cortada",
+                                               f"Fallaron {ERRORES_PARA_RENDIRSE} consultas seguidas al SIU.", str(e).splitlines()[0])
+                            sys.exit(1)
+                        LOCK_INSCRIPCION.touch()
+                        time.sleep(ESPERA_ERROR_SEG)
+                        continue
+                    ahora = time.time()
+                    if motivo and (motivo != previo or ahora - ultimo_log > LATIDO_SEG):
+                        log(f"Esperando: {motivo}")
+                        if motivo.startswith("ambiguo") and motivo != previo:
+                            avisar_inscripcion("Inscripción: hace falta tu ayuda", "No sé cuál materia elegir.", motivo)
+                        previo, ultimo_log = motivo, ahora
+                    time.sleep(random.uniform(minimo, maximo))
+            finally:
+                ctx.close()
+    except KeyboardInterrupt:
+        log("Inscripción automática cancelada (Ctrl+C).")
+    finally:
+        LOCK_INSCRIPCION.unlink(missing_ok=True)
+
+
 def cmd_check() -> None:
     estado = cargar_estado()
     with sync_playwright() as p:
@@ -644,7 +1214,7 @@ def cmd_check() -> None:
             if not ir_al_inicio(page):
                 # Avisamos una sola vez hasta que se vuelva a loguear.
                 if not estado.get("aviso_sesion_vencida"):
-                    comando = plataforma().comando("login")
+                    comando = comando_cli("login")
                     enviar_mail(
                         "SIU: hay que volver a iniciar sesión",
                         f"No pude entrar al SIU. Corré en la carpeta siu:\n\n    {comando}\n",
@@ -818,6 +1388,10 @@ def check_con_aviso_de_error() -> None:
     if en_silencio():
         log(f"Horario de silencio (SIU_SILENCIO={os.getenv('SIU_SILENCIO')}), no reviso.")
         return
+    if inscripcion_en_curso():
+        # `inscribir` tiene abierto ./perfil: intentar abrirlo acá fallaría y contaría como error.
+        log("Hay una inscripción automática en curso, salto esta revisión.")
+        return
     try:
         try:
             cmd_check()
@@ -846,7 +1420,7 @@ def check_con_aviso_de_error() -> None:
                         "Monitor con errores",
                         f"Las últimas {FALLOS_PARA_AVISAR} revisiones del SIU fallaron. "
                         "Mirá el log o corré el check a mano para ver el error:",
-                        plataforma().comando("check"),
+                        comando_cli("check"),
                         INICIO,
                     ),
                 )
@@ -879,6 +1453,8 @@ def cmd_verificar() -> None:
 
 
 def cmd_programar() -> None:
+    if USUARIO:
+        sys.exit("La tarea programada es solo del usuario principal (sin --usuario).")
     intervalo = int(os.getenv("SIU_INTERVALO_MIN", "60"))
     cmd_verificar()
     log(f"Programando '{NOMBRE_TAREA}' cada {intervalo} min en {plataforma().nombre}.")
@@ -886,6 +1462,8 @@ def cmd_programar() -> None:
 
 
 def cmd_desprogramar() -> None:
+    if USUARIO:
+        sys.exit("La tarea programada es solo del usuario principal (sin --usuario).")
     plataforma().desprogramar(NOMBRE_TAREA)
     log(f"Tarea '{NOMBRE_TAREA}' eliminada.")
 
@@ -893,6 +1471,8 @@ def cmd_desprogramar() -> None:
 if __name__ == "__main__":
     comandos = {
         "login": cmd_login,
+        "cookies": cmd_cookies,
+        "usuarios": cmd_usuarios,
         "check": check_con_aviso_de_error,
         "dump": cmd_dump,
         "test-mail": cmd_test_mail,
@@ -901,6 +1481,11 @@ if __name__ == "__main__":
         "programar": cmd_programar,
         "desprogramar": cmd_desprogramar,
     }
-    if len(sys.argv) != 2 or sys.argv[1] not in comandos:
-        sys.exit(f"Uso: python siu_notas.py [{'|'.join(comandos)}]")
-    comandos[sys.argv[1]]()
+    if len(sys.argv) >= 2 and sys.argv[1] == "inscribir":
+        cmd_inscribir(sys.argv[2:])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "agregar-usuario":
+        cmd_agregar_usuario(sys.argv[2:])
+    elif len(sys.argv) != 2 or sys.argv[1] not in comandos:
+        sys.exit(f"Uso: python siu_notas.py [{'|'.join([*comandos, 'inscribir', 'agregar-usuario'])}]")
+    else:
+        comandos[sys.argv[1]]()
