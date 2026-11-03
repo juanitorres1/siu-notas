@@ -66,3 +66,31 @@ class Windows(Plataforma):
 
     def desprogramar(self, nombre: str) -> None:
         _powershell(f"Unregister-ScheduledTask -TaskName {_ps(nombre)} -Confirm:$false")
+
+    def programar_al_iniciar(self, nombre: str, argumentos: list[str]) -> str:
+        script = self.base / "siu_notas.py"
+        linea = subprocess.list2cmdline([str(script), *argumentos])  # comillas correctas para alias con espacios
+        # Sin ExecutionTimeLimit (0 = ilimitado): por defecto Windows mata las tareas a las 72 h.
+        # Sin reintentos automáticos: un fallo ya avisa por mail y reintentar mandaría el aviso en bucle.
+        return _powershell(f"""
+            $accion  = New-ScheduledTaskAction -Execute {_ps(str(self.python_sin_consola))} `
+                         -Argument {_ps(linea)} -WorkingDirectory {_ps(str(self.base))}
+            $disparo = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+            $disparo.Delay = 'PT30S'   # deja que arranque la red
+            $config  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                         -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
+            Register-ScheduledTask -TaskName {_ps(nombre)} -Action $accion -Trigger $disparo -Settings $config -Force | Out-Null
+            "Estado: " + (Get-ScheduledTask -TaskName {_ps(nombre)}).State
+        """)
+
+    def estado_tarea(self, nombre: str) -> str:
+        return _powershell(f"""
+            $t = Get-ScheduledTask -TaskName {_ps(nombre)} -ErrorAction SilentlyContinue
+            if ($t) {{ $t.State.ToString() }} else {{ 'no existe' }}
+        """)
+
+    def iniciar_tarea(self, nombre: str) -> None:
+        _powershell(f"Start-ScheduledTask -TaskName {_ps(nombre)}")
+
+    def detener_tarea(self, nombre: str) -> None:
+        _powershell(f"Stop-ScheduledTask -TaskName {_ps(nombre)} -ErrorAction SilentlyContinue; 'ok'")

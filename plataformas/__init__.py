@@ -69,7 +69,31 @@ class Plataforma(ABC):
 
     @abstractmethod
     def desprogramar(self, nombre: str) -> None:
-        """Elimina la ejecución periódica creada por `programar`."""
+        """Elimina la ejecución periódica creada por `programar` (y la de `programar_al_iniciar`)."""
+
+    # ---- arranque al iniciar sesión (opcional: por defecto, no soportado) ----
+    # No son abstractos para no obligar a los sistemas que todavía no lo implementan.
+
+    def _no_soportado(self) -> PlataformaNoSoportada:
+        return PlataformaNoSoportada(f"El arranque automático todavía no está implementado en {self.nombre or sys.platform}.")
+
+    def programar_al_iniciar(self, nombre: str, argumentos: list[str]) -> str:
+        """Crea o reemplaza una tarea que corre `siu_notas.py <argumentos>` al iniciar sesión el usuario,
+        sin ventana, sin límite de tiempo, con batería y sin superponer instancias.
+        Devuelve un texto con el estado."""
+        raise self._no_soportado()
+
+    def estado_tarea(self, nombre: str) -> str:
+        """Estado de la tarea ('Ready', 'Running'...) o 'no existe'."""
+        raise self._no_soportado()
+
+    def iniciar_tarea(self, nombre: str) -> None:
+        """La arranca ahora, sin esperar al próximo inicio de sesión."""
+        raise self._no_soportado()
+
+    def detener_tarea(self, nombre: str) -> None:
+        """La detiene si está corriendo (no la elimina)."""
+        raise self._no_soportado()
 
 
 # sys.platform -> (módulo, clase). Import perezoso: cada sistema solo carga lo suyo.
